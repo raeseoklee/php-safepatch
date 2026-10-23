@@ -1,0 +1,8 @@
+* text=auto
+# bash fails on CRLF line endings; PowerShell 5.1 and Windows tools expect CRLF.
+*.sh   text eol=lf
+*.Dockerfile text eol=lf
+*.conf text eol=lf
+*.yml  text eol=lf
+*.ini  text eol=lf
+*.ps1  text eol=crlf

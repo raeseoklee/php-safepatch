@@ -1,0 +1,105 @@
+# php-safepatch fleet playbook.
+#
+# Scan all hosts (no changes):
+#   ansible-playbook -i inventory.ini site.yml
+# Apply on one host at a time (stops at the first failed host):
+#   ansible-playbook -i inventory.ini site.yml -e safepatch_mode=apply
+#
+# Reports are copied to ./reports/<host>.json on the control node.
+# SPDX-License-Identifier: MIT
+
+- name: php-safepatch on Linux hosts
+  hosts: "{{ safepatch_linux_hosts | default('linux') }}"
+  become: true
+  gather_facts: false
+  serial: "{{ 1 if (safepatch_mode | default('scan')) == 'apply' else '100%' }}"
+  any_errors_fatal: "{{ (safepatch_mode | default('scan')) == 'apply' }}"
+  vars:
+    safepatch_mode: scan
+    safepatch_remote_dir: /usr/local/lib/php-safepatch
+    safepatch_advisory: "{{ playbook_dir }}/../advisories/php2shell.conf"
+    # Extra options, for example ["--include-optin", "--health-url", "https://example.com/health"]
+    safepatch_extra_args: []
+  tasks:
+    - name: Create the remote directory
+      ansible.builtin.file:
+        path: "{{ safepatch_remote_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Copy the script and the advisory
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ safepatch_remote_dir }}/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "{{ playbook_dir }}/../linux/php-safepatch.sh", dest: php-safepatch.sh, mode: "0700" }
+        - { src: "{{ safepatch_advisory }}", dest: advisory.conf, mode: "0600" }
+
+    - name: Run php-safepatch {{ safepatch_mode }}
+      ansible.builtin.command:
+        argv: "{{ [safepatch_remote_dir ~ '/php-safepatch.sh', safepatch_mode,
+                   '--advisory', safepatch_remote_dir ~ '/advisory.conf',
+                   '--json', safepatch_remote_dir ~ '/last-report.json', '--quiet']
+                  + (['--yes'] if safepatch_mode == 'apply' else [])
+                  + safepatch_extra_args }}"
+      register: safepatch_run
+      changed_when: "'Changes in this run' in safepatch_run.stdout"
+      # Exit 1 means "vulnerable runtime or indicator found". Only exit 2 is an execution error.
+      failed_when: safepatch_run.rc not in [0, 1]
+
+    - name: Show the report
+      ansible.builtin.debug:
+        msg: "{{ safepatch_run.stdout_lines }}"
+
+    - name: Fetch the JSON report
+      ansible.builtin.fetch:
+        src: "{{ safepatch_remote_dir }}/last-report.json"
+        dest: "{{ playbook_dir }}/reports/{{ inventory_hostname }}.json"
+        flat: true
+
+- name: php-safepatch on Windows hosts
+  hosts: "{{ safepatch_windows_hosts | default('windows') }}"
+  gather_facts: false
+  serial: "{{ 1 if (safepatch_mode | default('scan')) == 'apply' else '100%' }}"
+  any_errors_fatal: "{{ (safepatch_mode | default('scan')) == 'apply' }}"
+  vars:
+    safepatch_mode: scan
+    safepatch_remote_dir: C:\ProgramData\php-safepatch\bin
+    safepatch_advisory: "{{ playbook_dir }}/../advisories/php2shell.conf"
+    # Extra options, for example ["-IncludeOptIn", "-HealthUrl", "https://example.com/health"]
+    safepatch_extra_args: []
+  tasks:
+    - name: Create the remote directory
+      ansible.windows.win_file:
+        path: "{{ safepatch_remote_dir }}"
+        state: directory
+
+    - name: Copy the script and the advisory
+      ansible.windows.win_copy:
+        src: "{{ item.src }}"
+        dest: "{{ safepatch_remote_dir }}\\{{ item.dest }}"
+      loop:
+        - { src: "{{ playbook_dir }}/../windows/php-safepatch.ps1", dest: php-safepatch.ps1 }
+        - { src: "{{ safepatch_advisory }}", dest: advisory.conf }
+
+    - name: Run php-safepatch {{ safepatch_mode }}
+      ansible.windows.win_command: >-
+        powershell.exe -NoProfile -ExecutionPolicy Bypass
+        -File "{{ safepatch_remote_dir }}\php-safepatch.ps1" {{ safepatch_mode }}
+        -Advisory "{{ safepatch_remote_dir }}\advisory.conf"
+        -Json "{{ safepatch_remote_dir }}\last-report.json" -Quiet
+        {{ '-Yes' if safepatch_mode == 'apply' else '' }} {{ safepatch_extra_args | join(' ') }}
+      register: safepatch_run
+      changed_when: "'Changes in this run' in safepatch_run.stdout"
+      failed_when: safepatch_run.rc not in [0, 1]
+
+    - name: Show the report
+      ansible.builtin.debug:
+        msg: "{{ safepatch_run.stdout_lines }}"
+
+    - name: Fetch the JSON report
+      ansible.builtin.fetch:
+        src: "{{ safepatch_remote_dir }}\\last-report.json"
+        dest: "{{ playbook_dir }}/reports/{{ inventory_hostname }}.json"
+        flat: true

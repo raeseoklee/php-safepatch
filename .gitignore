@@ -1,0 +1,4 @@
+ansible/inventory.ini
+ansible/reports/
+tests/out/
+*.log
