@@ -20,6 +20,9 @@
     safepatch_advisory: "{{ playbook_dir }}/../advisories/php2shell.conf"
     # Extra options, for example ["--include-optin", "--health-url", "https://example.com/health"]
     safepatch_extra_args: []
+    # In apply mode, stop the rolling update when a host is still not patched or shows an
+    # indicator of compromise (exit code 1). Set to false to continue on such hosts.
+    safepatch_fail_on_unpatched: true
   tasks:
     - name: Create the remote directory
       ansible.builtin.file:
@@ -45,7 +48,8 @@
                   + safepatch_extra_args }}"
       register: safepatch_run
       changed_when: "'Changes in this run' in safepatch_run.stdout"
-      # Exit 1 means "vulnerable runtime or indicator found". Only exit 2 is an execution error.
+      # Exit 2 is an execution error. Exit 1 ("not patched or indicator found") is checked
+      # after the report is fetched, by the last task.
       failed_when: safepatch_run.rc not in [0, 1]
 
     - name: Show the report
@@ -58,6 +62,14 @@
         dest: "{{ playbook_dir }}/reports/{{ inventory_hostname }}.json"
         flat: true
 
+    - name: Stop the rolling update on a host that is still not patched
+      ansible.builtin.fail:
+        msg: >-
+          php-safepatch apply finished with exit code 1 on {{ inventory_hostname }}: a runtime is still
+          not patched (for example RESTART_REQUIRED, VULNERABLE_EOL) or an indicator was found.
+          Read reports/{{ inventory_hostname }}.json. Set safepatch_fail_on_unpatched=false to continue.
+      when: safepatch_mode == 'apply' and safepatch_run.rc == 1 and (safepatch_fail_on_unpatched | bool)
+
 - name: php-safepatch on Windows hosts
   hosts: "{{ safepatch_windows_hosts | default('windows') }}"
   gather_facts: false
@@ -69,6 +81,9 @@
     safepatch_advisory: "{{ playbook_dir }}/../advisories/php2shell.conf"
     # Extra options, for example ["-IncludeOptIn", "-HealthUrl", "https://example.com/health"]
     safepatch_extra_args: []
+    # In apply mode, stop the rolling update when a host is still not patched or shows an
+    # indicator of compromise (exit code 1). Set to false to continue on such hosts.
+    safepatch_fail_on_unpatched: true
   tasks:
     - name: Create the remote directory
       ansible.windows.win_file:
@@ -103,3 +118,11 @@
         src: "{{ safepatch_remote_dir }}\\last-report.json"
         dest: "{{ playbook_dir }}/reports/{{ inventory_hostname }}.json"
         flat: true
+
+    - name: Stop the rolling update on a host that is still not patched
+      ansible.builtin.fail:
+        msg: >-
+          php-safepatch apply finished with exit code 1 on {{ inventory_hostname }}: a runtime is still
+          not patched (for example RESTART_REQUIRED, VULNERABLE_EOL) or an indicator was found.
+          Read reports/{{ inventory_hostname }}.json. Set safepatch_fail_on_unpatched=false to continue.
+      when: safepatch_mode == 'apply' and safepatch_run.rc == 1 and (safepatch_fail_on_unpatched | bool)

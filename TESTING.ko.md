@@ -6,7 +6,7 @@ php-safepatch는 운영 서버를 바꾸는 도구입니다. 그래서 스크립
 
 | 테스트 | 명령 | 필요한 것 | 소요 시간 |
 |---|---|---|---|
-| 단위 | `tests/run.sh unit` | bash 4 (Linux, macOS, Git Bash) | 1분 미만 |
+| 단위 | `tests/run.sh unit` | bash 4.4 (Linux, macOS, Git Bash) | 1분 (Git Bash에서는 약 5분) |
 | 컨테이너 | `tests/run.sh containers` | Docker 또는 Podman, 인터넷 | 10~20분 |
 | Windows | `tests\windows\run.ps1` | Windows, PowerShell 5.1, 인터넷 | 2~5분 |
 
@@ -21,6 +21,12 @@ php-safepatch는 운영 서버를 바꾸는 도구입니다. 그래서 스크립
 - 처음부터 깨져 있던 PHP-FPM 설정: 해당 브랜치를 건드리지 않음
 - 변경 때문에 설정 검사가 실패한 경우: 모든 파일이 실행 전 상태로 돌아옴
 - 브랜치 고정: 같은 브랜치 안의 업그레이드는 진행하고, 시뮬레이션에서 다른 브랜치를 설치하거나 패키지를 제거하면 설치를 멈춤
+- 버전 판정: advisory에 없는 브랜치(8.6.0)와 수정본 이후의 사전 릴리스(8.5.13-dev)는 `UNKNOWN`, 수정본의 사전 릴리스(8.5.12RC1)는 `VULNERABLE`이며, 배포판 접미사는 사전 릴리스로 보지 않음
+- 완화를 읽지 않는 런타임은 `not_effective`로 판정하고 실행을 실패로 처리함
+- auto 모드에서 패치된 브랜치는 PHP-FPM 풀 블록까지 포함해 남은 완화를 모두 지움
+- 헬스 체크 URL이 200에서 404로 바뀌면 실행을 실패로 처리하고 파일을 되돌림
+- advisory 파일은 빈 상태에서 읽고, 잘못된 파일이면 실행을 멈춤
+- dnf 트랜잭션 검사: 모듈 스트림 변경, 패키지 제거, 다른 브랜치 패키지, 시뮬레이션 실패가 있으면 설치를 멈춤
 
 ## 컨테이너 테스트
 
@@ -43,6 +49,8 @@ php-safepatch는 운영 서버를 바꾸는 도구입니다. 그래서 스크립
 4. 같은 명령을 한 번 더 실행해도 `/etc`가 바뀌지 않습니다.
 5. 완화 실행을 `rollback`하면 파일이 사라지고, 패치 실행을 `rollback`하면 이전 패키지 버전이 다시 설치됩니다.
 6. 처음부터 깨져 있던 PHP-FPM 설정이 있으면 `apply`는 종료 코드 2로 멈추고 아무것도 바꾸지 않습니다.
+
+컨테이너마다 PHP-FPM을 별도 설정 파일(`-y /etc/php-custom/php-fpm.conf`)로 띄워 두고 다음을 확인합니다. php-safepatch가 패키지 기본값이 아니라 그 파일을 쓰는지, 패키지를 업그레이드한 뒤 마스터를 재시작하기 전까지 `RESTART_REQUIRED`로 판정하는지, 완화가 재시작 전에는 `pending_restart`이고 재시작 후에는 `effective`인지 봅니다.
 
 일부 결과는 테스트하는 날의 저장소 상태에 따라 달라집니다.
 
@@ -89,6 +97,8 @@ short-name-mode = "permissive"
 - 완화 블록이 첫 `[PATH=]` 섹션 앞에 들어가서, `php -r`에서 새 값이 보입니다.
 - `apply`를 한 번 더 실행해도 아무것도 바뀌지 않습니다.
 - `rollback`이 이전 바이너리와 원래 `php.ini`를 되돌립니다.
+- PHP 없이 하는 함수 검사: 판정·헬스 체크·인수 분리 함수를 구문 트리에서 꺼내 직접 시험합니다(8.6.0, RC·dev 빌드, 200 -> 404).
+- auto 모드에서 패치된 설치본의 남은 완화를 지우는지, advisory 파일을 빈 상태에서 읽고 검증하는지 확인합니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\windows\run.ps1

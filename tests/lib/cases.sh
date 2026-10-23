@@ -20,12 +20,10 @@ BRANCH="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
 FPM="$(ls /usr/sbin/php-fpm* 2>/dev/null | head -1)"
 if [ "$FAMILY" = debian ]; then
   INI_DIRS=(/etc/php/"$BRANCH"/*/conf.d)
-  POOL_DIR="/etc/php/$BRANCH/fpm/pool.d"
   APACHE_CONF=/etc/apache2/conf-available/php-safepatch-php2shell.conf
   APACHECTL=apache2ctl
 else
   INI_DIRS=(/etc/php.d)
-  POOL_DIR=/etc/php-fpm.d
   APACHE_CONF=/etc/httpd/conf.d/zz-php-safepatch-php2shell.conf
   APACHECTL=apachectl
 fi
@@ -45,13 +43,30 @@ etc_sum() { find /etc -xdev -type f -print0 2>/dev/null | sort -z | xargs -0 md5
 modules() { php -m 2>/dev/null | grep -v '^\[' | grep -v '^$' | sort -u; }
 upload_progress() { php -i 2>/dev/null | awk -F' => ' '/^session.upload_progress.enabled/ {print $2; exit}'; }
 run_dir_of() { json_field "$1" run_dir; }
+fpm_field() {  # fpm_field JSON FIELD -- a field of the PHP-FPM runtime in a report
+  grep -o '{"path":"[^"]*","sapi":"fpm-fcgi"[^}]*' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+}
+
+# A PHP-FPM master that runs with its own configuration file (-y). php-safepatch must find this
+# file from the running process, and must not use the package default.
+CUSTOM=/etc/php-custom
+POOL_DIR="$CUSTOM/pool.d"
+fpm_start() { "$FPM" -y "$CUSTOM/php-fpm.conf" && sleep 1 && [ -s /run/php-custom-fpm.pid ]; }
+fpm_stop() { [ -s /run/php-custom-fpm.pid ] && kill "$(cat /run/php-custom-fpm.pid)" 2>/dev/null; sleep 2; }
+fpm_restart() { fpm_stop; fpm_start; }
+if [ -n "$FPM" ]; then
+  mkdir -p "$POOL_DIR"
+  printf '[global]\npid = /run/php-custom-fpm.pid\nerror_log = /tmp/php-custom-fpm.log\ndaemonize = yes\ninclude = %s/*.conf\n' "$POOL_DIR" >"$CUSTOM/php-fpm.conf"
+  printf '[custom]\nuser = daemon\nlisten = 127.0.0.1:9901\npm = static\npm.max_children = 1\n' >"$POOL_DIR/custom.conf"
+fi
 
 printf 'php-safepatch container test: family=%s branch=%s fpm=%s mod_php=%s\n' "$FAMILY" "$BRANCH" "${FPM:-none}" "$HAS_MOD_PHP"
 php -v | head -1
 pkgs >"$W/pkgs.0"; modules >"$W/mods.0"; VER0="$(php -r 'echo PHP_VERSION;')"
+[ -n "$FPM" ] && { fpm_start && pass "PHP-FPM runs with -y $CUSTOM/php-fpm.conf" || fail "PHP-FPM with -y $CUSTOM/php-fpm.conf does not start"; }
 
 # ---------------------------------------------------------------------------
-section "1. scan makes no change"
+section "1. scan makes no change and finds the real service configuration"
 SUM0="$(etc_sum)"
 bash "$S" scan "${COMMON[@]}" --json "$W/scan.json" >"$W/scan.out" 2>&1; rc=$?
 check_in "scan exit code is 0 or 1" "$rc" 0 1
@@ -61,12 +76,16 @@ grep -q '"sapi":"fpm-fcgi"' "$W/scan.json" && pass "scan finds PHP-FPM" || fail 
 if [ "$HAS_MOD_PHP" -eq 1 ]; then
   grep -q '"sapi":"apache2handler"' "$W/scan.json" && pass "scan finds mod_php" || fail "scan finds mod_php"
 fi
+if [ -n "$FPM" ]; then
+  check_eq "PHP-FPM is running" yes "$(fpm_field "$W/scan.json" running)"
+  check_eq "PHP-FPM config is the one of the running master (-y)" "$CUSTOM/php-fpm.conf" "$(fpm_field "$W/scan.json" fpm_conf)"
+fi
 STATUS0="$(grep -o '"status":"[A-Z_]*"' "$W/scan.json" | head -1 | cut -d'"' -f4)"
 printf 'info  status before apply: %s\n' "$STATUS0"
 sed -n '/^STATUS/,/^$/p' "$W/scan.out"
 
 # ---------------------------------------------------------------------------
-section "2. apply (patch only) stays in branch $BRANCH"
+section "2. apply (patch only) stays in branch $BRANCH; a running old process is RESTART_REQUIRED"
 bash "$S" apply "${COMMON[@]}" --yes --mitigate never --json "$W/patch.json" >"$W/patch.out" 2>&1; rc=$?
 check_in "apply exit code is 0 or 1" "$rc" 0 1
 RUN_P="$(run_dir_of "$W/patch.json")"
@@ -84,15 +103,22 @@ check_eq "no extension lost" "" "${MISSING% }"
 if [ -s "$RUN_P/packages.before" ]; then
   pass "packages upgraded and previous versions recorded ($(wc -l <"$RUN_P/packages.before") packages)"
   printf 'info  %s -> %s\n' "$VER0" "$(php -r 'echo PHP_VERSION;')"
+  if [ -n "$FPM" ]; then
+    # No systemd in the container, so php-safepatch cannot restart PHP-FPM: the old code still runs.
+    check_eq "binary on disk is PATCHED" PATCHED "$(fpm_field "$W/patch.json" installed)"
+    check_eq "running master uses the replaced binary (running=stale)" stale "$(fpm_field "$W/patch.json" running)"
+    check_eq "status is RESTART_REQUIRED, not PATCHED" RESTART_REQUIRED "$(fpm_field "$W/patch.json" status)"
+    fpm_restart
+    bash "$S" scan "${COMMON[@]}" --json "$W/scan2.json" >/dev/null 2>&1
+    check_eq "after the restart: status PATCHED" PATCHED "$(fpm_field "$W/scan2.json" status)"
+    check_eq "after the restart: running=yes" yes "$(fpm_field "$W/scan2.json" running)"
+  fi
 else
   skip "no newer package in the repositories (already patched, or vendor fix not published yet)"
 fi
-bash "$S" scan "${COMMON[@]}" --json "$W/scan2.json" >/dev/null 2>&1
-STATUS1="$(grep -o '"status":"[A-Z_]*"' "$W/scan2.json" | head -1 | cut -d'"' -f4)"
-printf 'info  status after patch: %s\n' "$STATUS1"
 
 # ---------------------------------------------------------------------------
-section "3. mitigation (--no-patch --mitigate always)"
+section "3. mitigation (--no-patch --mitigate always) reaches the configuration in use"
 bash "$S" apply "${COMMON[@]}" --yes --no-patch --mitigate always --json "$W/mit.json" >"$W/mit.out" 2>&1; rc=$?
 check_in "apply exit code is 0 or 1" "$rc" 0 1
 RUN_M="$(run_dir_of "$W/mit.json")"
@@ -102,10 +128,12 @@ for d in "${INI_DIRS[@]}"; do
 done
 check_eq "CLI sees session.upload_progress.enabled = Off" "Off" "$(upload_progress)"
 if [ -n "$FPM" ]; then
-  check "php-fpm config test passes" "$FPM" -t
-  pool_hits=$(grep -l 'php-safepatch PHP2Shell mitigation' "$POOL_DIR"/*.conf 2>/dev/null | wc -l)
-  [ "$pool_hits" -gt 0 ] && pass "FPM pool files carry the admin-locked block ($pool_hits)" || fail "FPM pool files carry the admin-locked block"
-  check "FPM pool block uses php_admin_value" grep -q 'php_admin_value\[session.upload_progress.enabled\] = 0' "$POOL_DIR"/*.conf
+  check "php-fpm config test passes for the running configuration" "$FPM" -t -y "$CUSTOM/php-fpm.conf"
+  check "the pool of the running master carries the admin-locked block" grep -q 'php_admin_value\[session.upload_progress.enabled\] = 0' "$POOL_DIR/custom.conf"
+  check_eq "running master started before the change: mitigation=pending_restart" pending_restart "$(fpm_field "$W/mit.json" mitigation)"
+  fpm_restart
+  bash "$S" scan "${COMMON[@]}" --json "$W/scan3.json" >/dev/null 2>&1
+  check_eq "after the restart: mitigation=effective" effective "$(fpm_field "$W/scan3.json" mitigation)"
 fi
 if [ "$HAS_MOD_PHP" -eq 1 ]; then
   check "Apache mitigation config exists" test -f "$APACHE_CONF"
@@ -127,7 +155,7 @@ for d in "${INI_DIRS[@]}"; do
   [ -d "$d" ] || continue
   check "mitigation ini removed from $d" test ! -f "$d/99-php-safepatch-php2shell.ini"
 done
-check "FPM pool blocks removed" bash -c "! grep -q 'php-safepatch PHP2Shell' $POOL_DIR/*.conf"
+[ -n "$FPM" ] && check "FPM pool blocks removed" bash -c "! grep -q 'php-safepatch PHP2Shell' $POOL_DIR/*.conf"
 check_eq "CLI value back to On" "On" "$(upload_progress)"
 if [ "$HAS_MOD_PHP" -eq 1 ]; then
   check "Apache mitigation config removed" test ! -e "$APACHE_CONF"
@@ -143,6 +171,7 @@ if [ -s "$RUN_P/packages.before" ]; then
   else
     fail "package rollback restores PHP $VER0 (rc=$rc, now $(php -r 'echo PHP_VERSION;'))"
   fi
+  [ -n "$FPM" ] && fpm_restart
 else
   skip "package rollback (no packages were upgraded)"
 fi
@@ -150,7 +179,7 @@ fi
 # ---------------------------------------------------------------------------
 section "6. a PHP-FPM config that is already broken is not touched"
 if [ -n "$FPM" ]; then
-  POOL="$(ls "$POOL_DIR"/*.conf | head -1)"
+  POOL="$POOL_DIR/custom.conf"
   cp "$POOL" "$W/pool.orig"
   printf 'pm = not-a-valid-mode\n' >>"$POOL"           # makes "php-fpm -t" fail
   cp "$POOL" "$W/pool.broken"
@@ -163,6 +192,7 @@ if [ -n "$FPM" ]; then
     check "no ini written to $d" test ! -f "$d/99-php-safepatch-php2shell.ini"
   done
   cp "$W/pool.orig" "$POOL"
+  fpm_stop
 else
   skip "no PHP-FPM in this image"
 fi

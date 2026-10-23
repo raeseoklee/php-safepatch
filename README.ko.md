@@ -93,7 +93,15 @@ ansible-playbook -i ansible/inventory.ini ansible/site.yml -e safepatch_mode=app
 | `VULNERABLE` | 같은 브랜치에 해결 버전이 있음 | `apply` 실행 |
 | `VULNERABLE_EOL` | 7.4~8.1: 공식 릴리스 없음 | 배포판이나 LTS 업체의 백포트가 있으면 설치합니다. 없으면 완화 설정을 적용하고, 애플리케이션 테스트를 거쳐 업그레이드를 계획합니다. |
 | `VULNERABLE_NOFIX` | 7.3 이하: 수정본 없음 | 완화 설정을 적용하고, 인터넷에서 격리한 뒤 업그레이드를 계획합니다. |
-| `RESTART_REQUIRED` | 교체된 바이너리를 아직 프로세스가 쓰고 있음 | 서비스를 재시작합니다. |
+| `RESTART_REQUIRED` | 수정본은 디스크에 있지만, 프로세스가 아직 교체 전 바이너리를 쓰고 있음 | 서비스를 재시작합니다. |
+| `UNKNOWN` | 버전을 읽을 수 없거나, advisory에 없는 브랜치(예: 8.6)이거나, 사전 릴리스 빌드임 | PHP와 벤더 보안 공지를 직접 확인합니다. |
+
+"패치됨"과 "안전함"을 섞지 않도록, 보고서는 런타임마다 두 가지 정보를 더 보여 줍니다.
+
+- `running`: `yes`, `no`, `stale`(프로세스가 교체 전 코드를 실행 중)
+- `mitigation`: `none`, `effective`(서비스가 값을 읽고 있음), `pending_restart`(파일은 들어갔지만 프로세스가 변경 전에 시작됨), `not_effective`(파일은 들어갔지만 서비스가 읽지 않음, 오류로 처리)
+
+php-safepatch는 서비스마다 실제로 쓰는 설정을 읽습니다. 실행 중인 PHP-FPM 마스터의 `-y` 파일, systemd 유닛의 `-c`와 `PHP_INI_SCAN_DIR`가 여기에 해당합니다. Windows에서는 IIS FastCGI 애플리케이션마다 `arguments`와 `PHPRC`, 그리고 Apache의 `PHPIniDir`를 읽습니다. 헬스 체크 URL은 변경 후에도 변경 전과 같은 상태 코드를 돌려줘야 통과합니다. Ansible의 `apply`는 아직 패치되지 않은 호스트를 만나면 멈춥니다. 계속 진행하려면 `safepatch_fail_on_unpatched=false`를 지정하세요.
 
 ## 완화 설정에 관해
 
@@ -102,7 +110,60 @@ PHP 보안팀은 업데이트만이 PHP2Shell을 완전히 막는다고 밝혔�
 - `session.upload_progress.enabled=0`은 CVE-2026-109619를 막습니다. 세션 업로드 진행률 기능을 쓰는 업로드 진행 표시줄이 동작하지 않게 되지만, 이 기능을 쓰는 애플리케이션은 많지 않습니다.
 - `memory_limit=-1`(선택 규칙)은 CVE-2026-109618의 알려진 공격 경로를 막습니다. 대신 요청마다 걸리던 메모리 상한이 사라집니다. 컨테이너, cgroup, PHP-FPM의 메모리 제한과 함께 쓰세요. `--include-optin`을 주지 않으면 적용하지 않습니다.
 - `RLIMIT_AS`나 `RLIMIT_DATA`로 완화하려 하지 마세요. 공격에 필요한 메모리 할당 실패를 오히려 일으킬 수 있습니다.
-- 리버스 프록시나 웹 방화벽에서 요청 크기도 제한하세요. `Content-Length`가 없는 요청도 포함해야 합니다.
+- 리버스 프록시나 웹 방화벽에서 요청 크기도 제한하세요. `Content-Length`가 없는 요청도 포함해야 합니다. 방법은 다음 절을 참고하세요.
+
+## 리버스 프록시·웹 방화벽에서 막기
+
+당장 패치할 수 없다면, 아래 규칙으로 알려진 공격 요청이 PHP에 닿기 전에 막을 수 있습니다. 업데이트를 대신하지는 못합니다. 각 규칙은 ModSecurity 2.9(OWASP CRS 포함), nginx(stable), Apache 2.4에서 공격 형태의 요청과 정상 요청으로 시험했습니다.
+
+| 규칙 | ModSecurity | nginx | Apache |
+|---|---|---|---|
+| `PHP_SESSION_UPLOAD_PROGRESS` 필드 차단 (CVE-2026-109619) | 모든 경로 | 업로드가 없는 경로만 | 업로드가 없는 경로만 |
+| 지나치게 긴 파라미터 이름 차단 (CVE-2026-109618) | 가능 | 불가 | 불가 |
+| 본문 크기 제한 (chunked 요청 포함) | 가능 (CRS 기본값) | 가능 | 가능 |
+
+**ModSecurity (v2·v3, CRS 사용 여부와 무관).** CRS 규칙보다 먼저 읽히는 파일(예: `REQUEST-899-PHP2SHELL.conf`)에 넣으세요. `session.upload_progress.name`을 기본값에서 바꿨다면 첫 번째 규칙에 그 값을 쓰세요.
+
+```apache
+# CVE-2026-109619: block the session upload progress field in multipart requests.
+SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
+    "id:1026101,phase:2,deny,status:403,log,t:none,msg:'PHP2Shell: session upload progress field (CVE-2026-109619)'"
+# CVE-2026-109618: block very long parameter names (the known attack uses one of about 3.5 MB).
+SecRule ARGS_NAMES "@gt 1024" \
+    "id:1026102,phase:2,deny,status:403,log,t:none,t:length,msg:'PHP2Shell: parameter name longer than 1024 bytes (CVE-2026-109618)'"
+```
+
+`SecRequestBodyNoFilesLimit`는 작게(기본값 128KB) 두고, `SecRequestBodyLimitAction Reject`를 유지하세요.
+
+**nginx.** nginx는 폼 필드 이름을 읽지 못합니다. 그래서 업로드를 받지 않는 location에서 multipart 요청 자체를 막습니다.
+
+```nginx
+client_max_body_size 8m;          # also applies to chunked requests
+
+location / {                      # locations without file uploads
+    if ($content_type ~* "^multipart/form-data") { return 403; }
+    # ... your fastcgi_pass or proxy_pass ...
+}
+```
+
+**ModSecurity 없는 Apache.** `%{CONTENT_TYPE}`이 아니라 `%{HTTP:Content-Type}`을 쓰세요. Apache 표현식에서 `%{CONTENT_TYPE}`은 응답의 Content-Type이라서, 이것으로 만든 규칙은 아무것도 막지 못합니다.
+
+```apache
+LimitRequestBody 8388608          # also applies to chunked requests
+
+<LocationMatch "^/(?!upload)">    # paths without file uploads
+    <If "%{HTTP:Content-Type} =~ m#^multipart/form-data#i">
+        Require all denied
+    </If>
+</LocationMatch>
+```
+
+참고:
+
+- 웹 방화벽이나 프록시가 복호화된 트래픽을 볼 수 있어야 합니다. TLS를 종료하는 지점에 규칙을 두세요.
+- 크기 제한은 실제 업로드 크기를 보고 정하세요. 너무 작으면 파일 업로드가 깨집니다.
+- nginx와 Apache는 업로드 경로에서 이 필드를 막지 못합니다. 업로드 경로가 있는 서버부터 패치하거나, 그 서버에는 ModSecurity를 쓰세요.
+- 운영에 적용하기 전에 스테이징 서버에서 먼저 시험하세요.
 
 ## 환경별 참고 사항
 

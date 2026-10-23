@@ -117,24 +117,32 @@ function Get-ShortHash([string]$S) {
 }
 
 function Import-Advisory([string]$File) {
+    # An external advisory starts empty: nothing is inherited from the built-in PHP2Shell data.
     if (-not (Test-Path -LiteralPath $File)) { Die "Cannot read advisory file: $File" }
-    $seen = @{}
+    foreach ($k in 'id', 'cves', 'fixed', 'eol_backport', 'ioc_since') { $Adv[$k] = '' }
+    foreach ($k in 'mitigate', 'mitigate_optin', 'ioc_log') { $Adv[$k] = @() }
+    $bad = $false; $n = 0
     foreach ($raw in Get-Content -LiteralPath $File) {
-        $line = $raw.Trim()
-        if (-not $line -or $line.StartsWith('#')) { continue }
+        $n++
+        $line = $raw.TrimEnd("`r")
+        if (-not $line.Trim() -or $line.TrimStart().StartsWith('#')) { continue }
         $eq = $line.IndexOf('=')
-        if ($eq -lt 1) { continue }
+        if ($eq -lt 1) { Err "${File}:${n}: not key=value"; $bad = $true; continue }
         $k = $line.Substring(0, $eq).Trim(); $v = $line.Substring($eq + 1)
-        switch ($k) {
-            { $_ -in 'id', 'cves', 'fixed', 'eol_backport', 'ioc_since' } { $Adv[$k] = $v; break }
-            { $_ -in 'mitigate', 'mitigate_optin', 'ioc_log' } {
-                if (-not $seen.ContainsKey($k)) { $Adv[$k] = @(); $seen[$k] = $true }
-                if ($v) { $Adv[$k] = @($Adv[$k]) + $v }
-                break
-            }
-            default { Warn "Unknown advisory key ignored: $k" }
-        }
+        if ($k -in 'id', 'cves', 'fixed', 'eol_backport', 'ioc_since') { $Adv[$k] = $v }
+        elseif ($k -in 'mitigate', 'mitigate_optin', 'ioc_log') { $Adv[$k] = @($Adv[$k]) + $v }
+        else { Err "${File}:${n}: unknown key '$k'"; $bad = $true }
     }
+    # A wrong advisory must stop the run, not change servers in an unexpected way.
+    if ($Adv.id -notmatch '^[A-Za-z0-9._-]+$') { Err "${File}: 'id' is missing or has characters other than A-Z a-z 0-9 . _ -"; $bad = $true }
+    if (-not $Adv.cves.Trim()) { Err "${File}: 'cves' is missing"; $bad = $true }
+    if (-not $Adv.fixed.Trim()) { Err "${File}: 'fixed' is missing"; $bad = $true }
+    foreach ($x in ($Adv.fixed -split '\s+' | Where-Object { $_ })) { if ($x -notmatch '^\d+\.\d+\.\d+$') { Err "${File}: 'fixed' value '$x' is not X.Y.Z"; $bad = $true } }
+    foreach ($x in ($Adv.eol_backport -split '\s+' | Where-Object { $_ })) { if ($x -notmatch '^\d+\.\d+$') { Err "${File}: 'eol_backport' value '$x' is not X.Y"; $bad = $true } }
+    if ($Adv.ioc_since -and $Adv.ioc_since -notmatch '^\d{4}-\d{2}-\d{2}$') { Err "${File}: 'ioc_since' is not YYYY-MM-DD"; $bad = $true }
+    foreach ($x in @($Adv.mitigate) + @($Adv.mitigate_optin)) { if ($x -notmatch '^[A-Za-z0-9_.]+=[^@]*(@\d+\.\d+)?$') { Err "${File}: mitigation rule '$x' is not KEY=VALUE[@X.Y]"; $bad = $true } }
+    foreach ($x in @($Adv.ioc_log)) { if ($x -notmatch '^.+\|.+$') { Err "${File}: ioc_log '$x' is not LABEL|REGEX"; $bad = $true } }
+    if ($bad) { Die "Advisory file $File is not valid. No change was made." }
 }
 
 # Returns @(@{Key; Value}) for the rules that apply to a branch.
@@ -154,13 +162,14 @@ function Get-MitigationRules([string]$Branch) {
     return , $out
 }
 
-function Invoke-Php([string]$Exe, [string[]]$PhpArgs, [int]$TimeoutSec = 20) {
+function Invoke-Php([string]$Exe, [string[]]$PhpArgs, [int]$TimeoutSec = 20, [hashtable]$EnvVars = @{}) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
     $psi.Arguments = ($PhpArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.WorkingDirectory = Split-Path -Parent $Exe
+    foreach ($k in $EnvVars.Keys) { $psi.EnvironmentVariables[$k] = [string]$EnvVars[$k] }
     try {
         $p = [System.Diagnostics.Process]::Start($psi)
         $outTask = $p.StandardOutput.ReadToEndAsync()
@@ -289,7 +298,8 @@ function Get-PhpInfo([string]$Dir) {
     $info = [ordered]@{ Exe = $exe; Version = ''; Ts = ''; Arch = ''; Compiler = ''; Build = ''; Ini = '' }
     if ($line) {
         $parts = $line.Trim().Split('|')
-        if ($parts[0] -match '^(\d+\.\d+\.\d+)') { $info.Version = $Matches[1] }
+        # Keep a pre-release suffix (8.5.12RC1, 8.6.0-dev): such a build is not the fixed release.
+        if ($parts[0] -match '^(\d+\.\d+\.\d+)(-?(alpha|beta|RC|dev)\d*)?') { $info.Version = $Matches[1] + $Matches[2] }
         $info.Ts = if ($parts[1] -eq '1') { 'ts' } else { 'nts' }
         $info.Arch = if ($parts[2] -eq '64') { 'x64' } else { 'x86' }
     }
@@ -298,8 +308,6 @@ function Get-PhpInfo([string]$Dir) {
         switch ($Matches[1]) { '2017' { $info.Compiler = 'vc15' } '15' { $info.Compiler = 'vc15' } '2019' { $info.Compiler = 'vs16' } '16' { $info.Compiler = 'vs16' } '2022' { $info.Compiler = 'vs17' } '17' { $info.Compiler = 'vs17' } }
     }
     if ($info.Compiler) { $info.Build = '{0}-{1}-{2}' -f $info.Ts, $info.Compiler, $info.Arch }
-    $loaded = (Invoke-Php $exe @('-r', 'echo php_ini_loaded_file();')).Trim()
-    if ($loaded) { $info.Ini = $loaded } else { $info.Ini = Join-Path $Dir 'php.ini' }
     return $info
 }
 
@@ -311,13 +319,120 @@ function Get-DirUsers([string]$Dir) {
     return ($users | Select-Object -Unique)
 }
 
+# Splits a command-line argument string (IIS "arguments") into an array.
+function Split-Args([string]$S) {
+    $out = @()
+    foreach ($m in [regex]::Matches($S, '"([^"]*)"|(\S+)')) { if ($m.Groups[1].Success) { $out += $m.Groups[1].Value } else { $out += $m.Groups[2].Value } }
+    return $out   # callers wrap the result in @()
+}
+
+# The configurations that really load PHP from this directory: the CLI, every IIS FastCGI
+# application (its "arguments" and PHPRC), and Apache (PHPIniDir). Each gets the php.ini it reads.
+function Get-RuntimeConfigs([string]$Dir, [string]$Exe) {
+    $cfgs = New-Object System.Collections.ArrayList
+    $resolve = {
+        param([string[]]$PArgs, [hashtable]$PEnv)
+        $cli = Join-Path $Dir 'php.exe'
+        $loaded = ''
+        if (Test-Path -LiteralPath $cli) {
+            $loaded = (Invoke-Php $cli (@($PArgs) + @('-r', 'echo php_ini_loaded_file();')) 20 $PEnv).Trim()
+        } else {
+            $html = Invoke-Php $Exe (@($PArgs) + @('-i')) 20 $PEnv
+            if ($html -match 'Loaded Configuration File\s*(?:</td><td class="v">|=>)\s*([^<\r\n]+)') { $loaded = $Matches[1].Trim() }
+        }
+        if (-not $loaded -or $loaded -eq '(none)') { $loaded = Join-Path $Dir 'php.ini' }   # PHP reads it once it exists
+        return $loaded
+    }
+    [void]$cfgs.Add(@{ Source = 'cli'; Args = @(); Env = @{}; Ini = (& $resolve @() @{}) })
+    $hostCfg = Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'
+    if (Test-Path -LiteralPath $hostCfg) {
+        try {
+            [xml]$x = Get-Content -LiteralPath $hostCfg -Raw
+            foreach ($a in $x.SelectNodes('//fastCgi/application')) {
+                $full = [Environment]::ExpandEnvironmentVariables($a.fullPath)
+                if ($full -notlike "$Dir\*") { continue }
+                $pArgs = @(Split-Args ([string]$a.arguments)); $pEnv = @{}
+                foreach ($e in $a.SelectNodes('environmentVariables/environmentVariable')) {
+                    if ($e.name -in 'PHPRC', 'PHP_INI_SCAN_DIR') { $pEnv[$e.name] = [Environment]::ExpandEnvironmentVariables($e.value) }
+                }
+                [void]$cfgs.Add(@{ Source = "iis:$full $($a.arguments)".Trim(); Args = $pArgs; Env = $pEnv; Ini = (& $resolve $pArgs $pEnv) })
+            }
+        } catch { Warn "Cannot parse $hostCfg : $($_.Exception.Message)" }
+    }
+    foreach ($c in Get-ApacheConfs) {
+        $usesDir = $false
+        foreach ($m in (Select-String -LiteralPath $c -Pattern '^\s*LoadModule\s+php\w*_module\s+"?([^"]+)"?' -ErrorAction SilentlyContinue)) {
+            if ((Split-Path -Parent $m.Matches[0].Groups[1].Value.Trim().Replace('/', '\')).TrimEnd('\') -ieq $Dir) { $usesDir = $true }
+        }
+        if (-not $usesDir) { continue }
+        $iniDir = $Dir
+        foreach ($m in (Select-String -LiteralPath $c -Pattern '^\s*PHPIniDir\s+"?([^"]+)"?' -ErrorAction SilentlyContinue)) {
+            $iniDir = $m.Matches[0].Groups[1].Value.Trim().Replace('/', '\')
+        }
+        $ini = Join-Path $iniDir 'php.ini'
+        [void]$cfgs.Add(@{ Source = "apache:$c"; Args = @('-c', $ini); Env = @{}; Ini = $ini })
+    }
+    return , $cfgs
+}
+
 function Add-Runtime($Dir, $PhpInfo) {
+    $configs = Get-RuntimeConfigs $Dir $PhpInfo.Exe
     $rt = [ordered]@{
         path = $Dir; exe = $PhpInfo.Exe; version = $PhpInfo.Version; branch = (Get-Branch $PhpInfo.Version)
-        build = $PhpInfo.Build; ini = $PhpInfo.Ini; used_by = @(Get-DirUsers $Dir)
-        status = ''; reason = ''; action = ''
+        build = $PhpInfo.Build; used_by = @(Get-DirUsers $Dir)
+        configs = $configs; inis = @($configs | ForEach-Object { $_.Ini } | Select-Object -Unique)
+        status = ''; installed = ''; running = 'no'; mitigation = 'none'; mitigated = $false; reason = ''; action = ''
     }
     [void]$Script:Runtimes.Add($rt)
+}
+
+# ---------------------------------------------------------------------------
+# Running processes and mitigation state
+# ---------------------------------------------------------------------------
+function Get-DirProcesses([string]$Dir) {
+    return @(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -and $_.Path -like "$Dir\*" } catch { $false } })
+}
+
+function Set-Running($rt) {
+    $rt.running = if (@(Get-DirProcesses $rt.path).Count -gt 0) { 'yes' } else { 'no' }
+}
+
+function ConvertTo-IniNorm([string]$V) {
+    $v = "$V".Trim().ToLowerInvariant()
+    if ($v -in 'on', '1', 'true', 'yes') { return '1' }
+    if ($v -in 'off', '0', 'false', 'no', '') { return '0' }
+    return $v
+}
+
+function Test-HasMitigationBlock([string]$Ini) {
+    if (-not (Test-Path -LiteralPath $Ini)) { return $false }
+    return (@(Get-Content -LiteralPath $Ini) -contains "; >>> php-safepatch $($Adv.id) mitigation >>>")
+}
+
+# none | effective | pending_restart | not_effective
+function Set-MitigationState($rt) {
+    $withBlock = @($rt.inis | Where-Object { Test-HasMitigationBlock $_ })
+    if ($withBlock.Count -eq 0) { $rt.mitigation = 'none'; return }
+    $rules = Get-MitigationRules $rt.branch
+    $cli = Join-Path $rt.path 'php.exe'
+    $bad = $false
+    if ($rules.Count -gt 0 -and (Test-Path -LiteralPath $cli)) {
+        foreach ($cfg in $rt.configs) {
+            # Read each value the way this service reads php.ini.
+            foreach ($r in $rules) {
+                $code = 'echo ini_get(' + [char]39 + $r.Key + [char]39 + ');'
+                $got = (Invoke-Php $cli (@($cfg.Args) + @('-r', $code)) 20 $cfg.Env).Trim()
+                if ((ConvertTo-IniNorm $got) -ne (ConvertTo-IniNorm $r.Value)) { $bad = $true }
+            }
+        }
+    }
+    if ($bad) { $rt.mitigation = 'not_effective'; return }
+    $newest = ($withBlock | ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } | Sort-Object | Select-Object -Last 1)
+    $old = @(Get-DirProcesses $rt.path | Where-Object { try { $_.StartTime -lt $newest } catch { $false } })
+    if ($rt.used_by -contains 'apache') {
+        $old += @(Get-Process -Name httpd -ErrorAction SilentlyContinue | Where-Object { try { $_.StartTime -lt $newest } catch { $false } })
+    }
+    $rt.mitigation = if ($old.Count -gt 0) { 'pending_restart' } else { 'effective' }
 }
 
 # ---------------------------------------------------------------------------
@@ -327,15 +442,21 @@ function Test-BadStatus([string]$S) { return ($S -ne 'PATCHED') }
 
 function Set-Assessment($rt) {
     $v = $rt.version; $b = $rt.branch
-    if (-not $v) { $rt.status = 'UNKNOWN'; $rt.reason = 'Version not readable'; $rt.action = 'Check this installation manually'; return }
+    if (-not $v) { $rt.status = 'UNKNOWN'; $rt.installed = 'UNKNOWN'; $rt.reason = 'Version not readable'; $rt.action = 'Check this installation manually'; return }
+    $base = ($v -replace '^(\d+\.\d+\.\d+).*$', '$1'); $pre = $v.Substring($base.Length)
     $fixed = Get-FixedFor $b
-    if ($fixed -and (Compare-Ver $v $fixed) -ge 0) { $rt.status = 'PATCHED'; $rt.reason = "Version $v >= $fixed" }
-    elseif ($fixed) { $rt.status = 'VULNERABLE'; $rt.reason = "Version $v < $fixed" }
+    $low = Get-LowestFixedBranch
+    # Only a release that the advisory names as fixed counts as safe.
+    if ($fixed -and -not $pre -and (Compare-Ver $base $fixed) -ge 0) { $rt.status = 'PATCHED'; $rt.reason = "Version $v >= $fixed" }
+    elseif ($fixed -and $pre -and (Compare-Ver $base $fixed) -gt 0) { $rt.status = 'UNKNOWN'; $rt.reason = "Pre-release build $v after the fixed release $fixed; the advisory does not say it is fixed" }
+    elseif ($fixed) { $rt.status = 'VULNERABLE'; $rt.reason = "Version $v is older than the fixed release $fixed" }
     elseif (($Adv.eol_backport -split '\s+') -contains $b) { $rt.status = 'VULNERABLE_EOL'; $rt.reason = "Branch $b is end-of-life; windows.php.net has no fixed build" }
-    elseif ((Compare-Ver $b (Get-LowestFixedBranch)) -lt 0) { $rt.status = 'VULNERABLE_NOFIX'; $rt.reason = "Branch $b has no upstream fix" }
-    else { $rt.status = 'PATCHED'; $rt.reason = "Branch $b is not in the affected range" }
+    elseif ($low -and (Compare-Ver $b $low) -lt 0) { $rt.status = 'VULNERABLE_NOFIX'; $rt.reason = "Branch $b has no upstream fix" }
+    else { $rt.status = 'UNKNOWN'; $rt.reason = "Branch $b is not covered by advisory $($Adv.id)" }
+    $rt.installed = $rt.status
     switch ($rt.status) {
         'PATCHED' { $rt.action = 'None' }
+        'UNKNOWN' { $rt.action = "Check the PHP advisories for $v manually" }
         'VULNERABLE' { $rt.action = "Install the fixed $b build ($($rt.build)) from windows.php.net; mitigate if that is not possible" }
         default { $rt.action = 'Mitigate now; plan a vendor build or an isolated upgrade with application tests' }
     }
@@ -374,6 +495,7 @@ function Test-Indicators {
         }
     }
     # PHP files changed after the reference date.
+    if (-not $Adv.ioc_since) { return }   # the advisory gives no reference date for changed files
     $since = [datetime]::ParseExact($Adv.ioc_since, 'yyyy-MM-dd', $null)
     $roots = @('C:\inetpub\wwwroot', 'C:\xampp\htdocs', 'C:\wamp64\www', 'C:\laragon\www') + (Get-IisSiteRoots) + $WebRoot
     $shellRx = 'eval\s*\(\s*(base64_decode|gzinflate|str_rot13|\$_(POST|GET|REQUEST|COOKIE))|assert\s*\(\s*\$_|(system|passthru|shell_exec|proc_open|popen)\s*\(\s*\$_'
@@ -400,10 +522,11 @@ function Show-Report {
     $o = New-Object System.Text.StringBuilder
     [void]$o.AppendLine('')
     [void]$o.AppendLine(('php-safepatch {0}  advisory {1} ({2})  host {3}  os windows' -f $SafepatchVersion, $Adv.id, $Adv.cves, $env:COMPUTERNAME))
-    [void]$o.AppendLine(('{0,-18} {1,-9} {2,-16} {3,-12} {4}' -f 'STATUS', 'VERSION', 'BUILD', 'USED BY', 'PATH'))
+    [void]$o.AppendLine(('{0,-18} {1,-11} {2,-14} {3,-8} {4,-16} {5,-11} {6}' -f 'STATUS', 'VERSION', 'BUILD', 'RUNNING', 'MITIGATION', 'USED BY', 'PATH'))
     foreach ($rt in $Script:Runtimes) {
         $ver = if ($rt.version) { $rt.version } else { '-' }
-        [void]$o.AppendLine(('{0,-18} {1,-9} {2,-16} {3,-12} {4}' -f $rt.status, $ver, $rt.build, (($rt.used_by) -join ','), $rt.path))
+        [void]$o.AppendLine(('{0,-18} {1,-11} {2,-14} {3,-8} {4,-16} {5,-11} {6}' -f $rt.status, $ver, $rt.build, $rt.running, $rt.mitigation, (($rt.used_by) -join ','), $rt.path))
+        foreach ($c in $rt.configs) { [void]$o.AppendLine(('{0,-18}    php.ini {1}  ({2})' -f '', $c.Ini, $c.Source)) }
         if (Test-BadStatus $rt.status) { [void]$o.AppendLine(('{0,-18} -> {1}. {2}' -f '', $rt.reason, $rt.action)) }
     }
     if ($Script:Runtimes.Count -eq 0) { [void]$o.AppendLine('(no PHP installation found)') }
@@ -429,7 +552,9 @@ function Get-JsonReport {
         time = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); command = $Command; run_dir = $Script:RunDir
         runtimes = @($Script:Runtimes | ForEach-Object {
                 [ordered]@{ path = $_.path; sapi = 'cli/cgi'; version = $_.version; branch = $_.branch; manager = 'windows-zip'; build = $_.build
-                    ini = $_.ini; used_by = @($_.used_by); status = $_.status; reason = $_.reason; action = $_.action }
+                    used_by = @($_.used_by); status = $_.status; installed = $_.installed; running = $_.running; mitigation = $_.mitigation
+                    configs = @($_.configs | ForEach-Object { [ordered]@{ source = $_.Source; php_ini = $_.Ini } })
+                    reason = $_.reason; action = $_.action }
             })
         dockerfiles = @(); indicators = @($Script:Indicators); changes = @($Script:Changes); errors = @($Script:Errors)
         summary = [ordered]@{ runtimes = $Script:Runtimes.Count; not_patched = (Get-BadCount); indicators = (Get-IndicatorCount) }
@@ -455,12 +580,14 @@ function Get-HttpCode([string]$Url) {
 }
 
 function Test-HealthAfter($Before) {
+    # A URL passes only if it gives the same status code as before the change.
     $ok = $true
     foreach ($u in $HealthUrl) {
         $b = $Before[$u]; $now = 0
-        for ($t = 0; $t -lt 5; $t++) { $now = Get-HttpCode $u; if ($now -gt 0 -and $now -lt 500) { break }; Start-Sleep -Seconds 3 }
+        if ($b -eq 0 -or $b -ge 500) { Warn "Health URL $u already failed before the change ($b); it cannot verify this run"; continue }
+        for ($t = 0; $t -lt 5; $t++) { $now = Get-HttpCode $u; if ($now -eq $b) { break }; Start-Sleep -Seconds 3 }
         Info "Health after: $u -> $now (before $b)"
-        if ($b -gt 0 -and $b -lt 500 -and ($now -eq 0 -or $now -ge 500)) { Err "Health check failed: $u was $b, now $now"; $ok = $false }
+        if ($now -ne $b) { Err "Health check failed: $u gave $b before the change and $now after it"; $ok = $false }
     }
     return $ok
 }
@@ -491,9 +618,15 @@ function Stop-PhpUsers([string]$Dir, $UsedBy) {
 }
 
 function Start-PhpUsers($Stopped) {
+    # Each start is tried on its own, so that one failure does not leave the other services stopped.
     foreach ($s in $Stopped) {
-        if ($s -eq 'iis') { Info 'Starting IIS (iisreset /start)'; & "$env:windir\System32\iisreset.exe" /start | Out-Null }
-        elseif ($s -like 'svc:*') { $n = $s.Substring(4); Info "Starting service $n"; Start-Service -Name $n }
+        try {
+            if ($s -eq 'iis') {
+                Info 'Starting IIS (iisreset /start)'
+                & "$env:windir\System32\iisreset.exe" /start | Out-Null
+                if ($LASTEXITCODE -ne 0) { Err "iisreset /start failed ($LASTEXITCODE). Start IIS manually." }
+            } elseif ($s -like 'svc:*') { $n = $s.Substring(4); Info "Starting service $n"; Start-Service -Name $n -ErrorAction Stop }
+        } catch { Err "Could not start $s : $($_.Exception.Message). Start it manually." }
     }
 }
 
@@ -558,21 +691,30 @@ function Update-PhpDir($rt) {
 
     $stopped = Stop-PhpUsers $rt.path $rt.used_by
     if ($null -eq $stopped) { return $false }
+    # From here the web services are stopped. "finally" starts them again in every case,
+    # also when an exception occurs; a partial copy is restored from the backup first.
     $bk = Join-Path $Script:RunDir ('backup\dir_' + (Get-ShortHash $rt.path))
-    Info "Backing up $($rt.path) to $bk"
-    & robocopy.exe $rt.path $bk /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { Err "Backup failed (robocopy $LASTEXITCODE)"; Start-PhpUsers $stopped; return $false }
-    Add-Manifest "DIR`t$($rt.path)`t$bk"
-    # Copy the new files over the old ones. php.ini, third-party extensions and other local files stay.
-    & robocopy.exe $ext $rt.path /E /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-    $rc = $LASTEXITCODE
-    if ($rc -ge 8) {
-        Err "Copy failed (robocopy $rc). Restoring $($rt.path)."
-        & robocopy.exe $bk $rt.path /MIR /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-        Start-PhpUsers $stopped
+    $copyStarted = $false; $ok = $false
+    try {
+        Info "Backing up $($rt.path) to $bk"
+        & robocopy.exe $rt.path $bk /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) { Err "Backup failed (robocopy $LASTEXITCODE)"; return $false }
+        Add-Manifest "DIR`t$($rt.path)`t$bk"
+        # Copy the new files over the old ones. php.ini, third-party extensions and other local files stay.
+        $copyStarted = $true
+        & robocopy.exe $ext $rt.path /E /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) { Err "Copy failed (robocopy $LASTEXITCODE). Restoring $($rt.path)."; return $false }
+        $ok = $true
+    } catch {
+        Err "Update of $($rt.path) failed: $($_.Exception.Message). Restoring."
         return $false
+    } finally {
+        if (-not $ok -and $copyStarted) {
+            & robocopy.exe $bk $rt.path /MIR /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { Err "Restore of $($rt.path) failed (robocopy $LASTEXITCODE). Restore it from $bk manually." }
+        }
+        Start-PhpUsers $stopped
     }
-    Start-PhpUsers $stopped
     [void]$Script:Changes.Add("binaries:$($rt.path) $($rt.version) -> $($z.Version) ($($rt.build))")
     return $true
 }
@@ -581,11 +723,18 @@ function Update-PhpDir($rt) {
 # Mitigation
 # ---------------------------------------------------------------------------
 function Set-IniMitigation($rt) {
+    # Every php.ini that a service of this directory reads (CLI, IIS FastCGI, Apache PHPIniDir).
     $rules = Get-MitigationRules $rt.branch
-    if ($rules.Count -eq 0) { return $false }
+    if ($rules.Count -eq 0) { Warn "Advisory $($Adv.id) has no mitigation rule for branch $($rt.branch). Nothing to mitigate."; return $false }
+    $changed = $false
+    foreach ($ini in $rt.inis) { if (Set-IniBlock $ini $rules) { $changed = $true } }
+    return $changed
+}
+
+function Set-IniBlock([string]$Ini, $Rules) {
     $begin = "; >>> php-safepatch $($Adv.id) mitigation >>>"
     $end = "; <<< php-safepatch $($Adv.id) mitigation <<<"
-    $ini = $rt.ini
+    $ini = $Ini; $rules = $Rules
     $old = @()
     if (Test-Path -LiteralPath $ini) { $old = @(Get-Content -LiteralPath $ini) }
     $new = New-Object System.Collections.ArrayList
@@ -612,8 +761,14 @@ function Set-IniMitigation($rt) {
 }
 
 function Remove-IniMitigation($rt) {
+    $changed = $false
+    foreach ($ini in $rt.inis) { if (Remove-IniBlock $ini) { $changed = $true } }
+    return $changed
+}
+
+function Remove-IniBlock([string]$Ini) {
     $begin = "; >>> php-safepatch $($Adv.id) mitigation >>>"
-    $ini = $rt.ini
+    $ini = $Ini
     if (-not (Test-Path -LiteralPath $ini)) { return $false }
     $old = @(Get-Content -LiteralPath $ini)
     if ($old -notcontains $begin) { return $false }
@@ -652,8 +807,14 @@ function Restore-Run([string]$Rd) {
 # ---------------------------------------------------------------------------
 function Invoke-Scan {
     foreach ($d in Find-PhpDirs) { Add-Runtime $d (Get-PhpInfo $d) }
-    foreach ($rt in $Script:Runtimes) { Set-Assessment $rt }
+    foreach ($rt in $Script:Runtimes) { Update-State $rt }
     Test-Indicators
+}
+
+function Update-State($rt) {
+    Set-Running $rt
+    Set-Assessment $rt
+    Set-MitigationState $rt
 }
 
 function Confirm-Action([string]$Question) {
@@ -674,7 +835,11 @@ function Test-Admin {
 function Invoke-Apply {
     if (-not (Test-Admin) -and $env:PHP_SAFEPATCH_TEST_NONROOT -ne '1') { Die 'apply must run as Administrator' }
     $todo = @($Script:Runtimes | Where-Object { $_.version -and ((Test-BadStatus $_.status) -or $Mitigate -eq 'always') })
-    if ($todo.Count -eq 0) { Info 'Nothing to apply on this host.'; return }
+    # Patched installations that still carry an old mitigation (for example memory_limit=-1):
+    # remove it in auto mode.
+    $cleanup = @()
+    if ($Mitigate -eq 'auto') { $cleanup = @($Script:Runtimes | Where-Object { $_.status -eq 'PATCHED' -and $_.mitigation -ne 'none' }) }
+    if ($todo.Count -eq 0 -and $cleanup.Count -eq 0) { Info 'Nothing to apply on this host.'; return }
     Show-Report
     $patchText = if ($NoPatch) { 'no' } else { 'same branch and build only' }
     $optText = if ($IncludeOptIn) { ' +opt-in rules' } else { '' }
@@ -703,20 +868,30 @@ function Invoke-Apply {
                 }
             }
         }
+        $rt.mitigated = $false
         if ($Mitigate -ne 'never') {
             if ((Test-BadStatus $rt.status) -or $Mitigate -eq 'always') {
                 if (Set-IniMitigation $rt) { Restart-PhpUsers $rt.used_by }
-                if (Test-BadStatus $rt.status) { $rt.reason += '; interim mitigation applied (not a complete fix)' }
+                $rt.mitigated = ((Get-MitigationRules $rt.branch).Count -gt 0)
             } elseif ($patched) {
-                [void](Remove-IniMitigation $rt)
+                if (Remove-IniMitigation $rt) { Restart-PhpUsers $rt.used_by }
             }
         }
         if ($patched -and $NoRestart) { Warn "IIS / Apache were restarted during the binary update of $($rt.path)." }
     }
+    foreach ($rt in $cleanup) { if (Remove-IniMitigation $rt) { Restart-PhpUsers $rt.used_by } }
+
+    # Verify with the state after the change: processes, values that each service reads, health.
+    foreach ($rt in $Script:Runtimes) { Update-State $rt }
+    foreach ($rt in $todo) {
+        if (-not $rt.mitigated) { continue }
+        if ($rt.mitigation -eq 'not_effective') { Err "Mitigation is written but a service of $($rt.path) does not use it. Check its php.ini, PHPRC and -c settings." }
+        elseif ($rt.mitigation -eq 'none') { Err "No mitigation block reaches $($rt.path)." }
+    }
     if (-not (Test-HealthAfter $before)) {
         Err 'Verification failed. Restoring everything this run changed.'
         Restore-Run $Script:RunDir
-        foreach ($rt in $Script:Runtimes) { Restart-PhpUsers $rt.used_by }
+        foreach ($rt in $Script:Runtimes) { Restart-PhpUsers $rt.used_by; Update-State $rt }
     }
 }
 

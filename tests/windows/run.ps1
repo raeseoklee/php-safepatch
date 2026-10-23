@@ -33,6 +33,34 @@ function Invoke-Safepatch([string[]]$A) {
 }
 function Get-PhpValue([string]$Code) { return (& "$PhpDir\php.exe" -r $Code) }
 
+Section 'Function checks (no PHP needed): functions are taken from the script by its syntax tree'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$null, [ref]$null)
+$want = 'Compare-Ver', 'Get-Branch', 'Get-FixedFor', 'Get-LowestFixedBranch', 'Set-Assessment', 'ConvertTo-IniNorm', 'Split-Args', 'Test-HealthAfter'
+foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($want -contains $fn.Name) { . ([scriptblock]::Create($fn.Extent.Text)) }
+}
+$Adv = [ordered]@{ id = 'PHP2Shell'; fixed = '8.2.35 8.3.36 8.4.27 8.5.12'; eol_backport = '7.4 8.0 8.1' }
+function Get-Status([string]$V) { $rt = @{ version = $V; branch = (Get-Branch $V); build = 'nts-vs16-x64'; status = ''; installed = ''; reason = ''; action = '' }; Set-Assessment $rt; return $rt.status }
+Check '8.3.36 is PATCHED' ((Get-Status '8.3.36') -eq 'PATCHED')
+Check '8.3.35 is VULNERABLE' ((Get-Status '8.3.35') -eq 'VULNERABLE')
+Check '8.6.0 (branch not in the advisory) is UNKNOWN, not PATCHED' ((Get-Status '8.6.0') -eq 'UNKNOWN')
+Check '8.5.12RC1 (pre-release of the fix) is VULNERABLE' ((Get-Status '8.5.12RC1') -eq 'VULNERABLE')
+Check '8.5.13-dev (pre-release after the fix) is UNKNOWN' ((Get-Status '8.5.13-dev') -eq 'UNKNOWN')
+Check '8.0.30 is VULNERABLE_EOL' ((Get-Status '8.0.30') -eq 'VULNERABLE_EOL')
+Check '7.3.33 is VULNERABLE_NOFIX' ((Get-Status '7.3.33') -eq 'VULNERABLE_NOFIX')
+Check 'ini values: Off = 0, On = 1' ((ConvertTo-IniNorm 'Off') -eq '0' -and (ConvertTo-IniNorm 'On') -eq '1' -and (ConvertTo-IniNorm '-1') -eq '-1')
+Check 'IIS arguments are split with quotes' ((@(Split-Args '-c "C:\My PHP\php.ini" -d x=1') -join '|') -eq '-c|C:\My PHP\php.ini|-d|x=1')
+# Health: a URL must give the same status code before and after the change.
+function Info($m) { } ; function Warn($m) { } ; function Err($m) { }
+function Start-Sleep { }
+$HealthUrl = @('http://app.test/health')
+$script:codes = @(404); function Get-HttpCode($u) { $c = $script:codes[0]; if ($script:codes.Count -gt 1) { $script:codes = $script:codes[1..($script:codes.Count - 1)] }; return $c }
+Check 'health 200 -> 404 fails' (-not (Test-HealthAfter @{ 'http://app.test/health' = 200 }))
+$script:codes = @(200)
+Check 'health 200 -> 200 passes' (Test-HealthAfter @{ 'http://app.test/health' = 200 })
+Remove-Item Function:\Start-Sleep, Function:\Info, Function:\Warn, Function:\Err
+$Adv = Join-Path $Repo 'advisories\php2shell.conf'
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $PhpDir = Join-Path $WorkDir 'php'
 $State = Join-Path $WorkDir 'state'
@@ -84,6 +112,25 @@ $rc = Invoke-Safepatch @('apply', '-Php', $PhpDir, '-StateDir', $State, '-Adviso
 $ap2 = Get-Content -LiteralPath "$WorkDir\apply2.json" -Raw | ConvertFrom-Json
 Check 'second apply exit code is 0' ($rc -eq 0)
 Check 'second apply changes nothing' (@($ap2.changes).Count -eq 0 -and (Get-Content -LiteralPath "$PhpDir\php.ini" -Raw) -eq $iniAfter1)
+Check 'the CLI reads the block (mitigation=effective)' ($ap2.runtimes[0].mitigation -eq 'effective')
+Check 'the report lists the php.ini of each configuration' (@($ap2.runtimes[0].configs).Count -ge 1 -and $ap2.runtimes[0].configs[0].php_ini -like '*php.ini')
+
+Section 'patched installation: auto mode removes the old mitigation'
+$rc = Invoke-Safepatch @('apply', '-Php', $PhpDir, '-StateDir', $State, '-Advisory', $Adv, '-NoIoc', '-Yes', '-NoRestart', '-Quiet', '-Json', "$WorkDir\clean.json")
+$cl = Get-Content -LiteralPath "$WorkDir\clean.json" -Raw | ConvertFrom-Json
+Check 'cleanup apply exit code is 0' ($rc -eq 0)
+Check 'mitigation block removed from php.ini' (@(Get-Content -LiteralPath "$PhpDir\php.ini") -notcontains '; >>> php-safepatch PHP2Shell mitigation >>>')
+Check 'memory_limit is no longer -1' ((Get-PhpValue 'echo ini_get(''memory_limit'');') -ne '-1')
+Check 'mitigation=none after cleanup' ($cl.runtimes[0].mitigation -eq 'none')
+
+Section 'advisory files start empty and are validated'
+Set-Content -LiteralPath "$WorkDir\other.conf" -Encoding ASCII -Value "id=OTHER-TEST`ncves=CVE-2099-0001`nfixed=8.6.1"
+$iniNow = Get-Content -LiteralPath "$PhpDir\php.ini" -Raw
+$rc = Invoke-Safepatch @('apply', '-Php', $PhpDir, '-StateDir', $State, '-Advisory', "$WorkDir\other.conf", '-NoIoc', '-Yes', '-NoRestart', '-NoPatch', '-Mitigate', 'always', '-IncludeOptIn', '-Quiet')
+Check 'no PHP2Shell rule is inherited (php.ini unchanged)' ((Get-Content -LiteralPath "$PhpDir\php.ini" -Raw) -eq $iniNow)
+Set-Content -LiteralPath "$WorkDir\bad.conf" -Encoding ASCII -Value "id=BAD`ncves=CVE-2099-0002`nfixed=8.2`nmitigate=memory_limit"
+$rc = Invoke-Safepatch @('scan', '-Php', $PhpDir, '-StateDir', $State, '-Advisory', "$WorkDir\bad.conf", '-NoIoc', '-Quiet')
+Check 'invalid advisory: exit code 2' ($rc -eq 2)
 
 Section 'rollback'
 $runId = Split-Path -Leaf $ap.run_dir

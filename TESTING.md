@@ -6,7 +6,7 @@ php-safepatch changes production servers. Thus every change to the scripts must 
 
 | Suite | Command | Needs | Time |
 |---|---|---|---|
-| Unit | `tests/run.sh unit` | bash 4 (Linux, macOS, Git Bash) | < 1 min |
+| Unit | `tests/run.sh unit` | bash 4.4 (Linux, macOS, Git Bash) | 1 min (about 5 min on Git Bash) |
 | Containers | `tests/run.sh containers` | Docker or Podman, internet | 10–20 min |
 | Windows | `tests\windows\run.ps1` | Windows, PowerShell 5.1, internet | 2–5 min |
 
@@ -21,6 +21,12 @@ The unit suite uses fake PHP binaries, a fake `dpkg-query` and a fake `apt-get`.
 - A PHP-FPM configuration that is already broken: the branch is not changed.
 - A change that breaks the configuration test: all files return to their state before the run.
 - The branch lock: an upgrade in the same branch runs, but a simulation that installs another branch or removes a package stops the install.
+- Version rules: a branch that is not in the advisory (8.6.0) and a pre-release after the fix (8.5.13-dev) are `UNKNOWN`; a pre-release of the fix (8.5.12RC1) is `VULNERABLE`; a distribution suffix is not a pre-release.
+- A runtime that does not read the mitigation is `not_effective` and the run fails.
+- In auto mode, a patched branch loses all old mitigation, also the PHP-FPM pool blocks.
+- A health URL that changes from 200 to 404 fails the run and restores the files.
+- Advisory files start empty; an invalid file stops the run.
+- The dnf transaction check: a module stream change, a removal, a package of another branch, or a failed simulation stops the install.
 
 ## Container suite
 
@@ -43,6 +49,8 @@ Each image installs PHP while the security repository is disabled, then restores
 4. The same command a second time does not change `/etc`.
 5. `rollback` of the mitigation run removes the files. `rollback` of the patch run reinstalls the old package versions.
 6. A PHP-FPM configuration that is already broken makes `apply` stop with exit code 2 and change nothing.
+
+Each container also starts PHP-FPM with its own configuration file (`-y /etc/php-custom/php-fpm.conf`). The suite checks that php-safepatch uses that file (not the package default), that the status is `RESTART_REQUIRED` after a package upgrade until the master restarts, and that the mitigation is `pending_restart` until the restart and `effective` after it.
 
 Some results depend on the repositories on the day of the test:
 
@@ -89,6 +97,8 @@ The Windows suite downloads an old official PHP build (default 8.3.35, NTS, x64)
 - The mitigation block goes before the first `[PATH=]` section, so `php -r` sees the new values.
 - A second `apply` changes nothing.
 - `rollback` restores the old binaries and the original `php.ini`.
+- Function checks without PHP: the assessment, health and argument functions are taken from the script by its syntax tree and tested directly (8.6.0, RC and dev builds, 200 -> 404).
+- In auto mode, a patched installation loses its old mitigation; advisory files start empty and are validated.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\windows\run.ps1

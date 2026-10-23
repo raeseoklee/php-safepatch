@@ -93,7 +93,15 @@ ansible-playbook -i ansible/inventory.ini ansible/site.yml -e safepatch_mode=app
 | `VULNERABLE` | 同じブランチに修正版がある | `apply` を実行 |
 | `VULNERABLE_EOL` | 7.4〜8.1：公式リリースなし | ディストリビューションや LTS ベンダーのバックポートがあれば適用します。なければ緩和設定を適用し、アプリケーションのテストを行ったうえでアップグレードを計画します。 |
 | `VULNERABLE_NOFIX` | 7.3 以前：修正なし | 緩和設定を適用し、インターネットから隔離し、アップグレードを計画します。 |
-| `RESTART_REQUIRED` | 置き換えられたバイナリをプロセスがまだ使っている | サービスを再起動します。 |
+| `RESTART_REQUIRED` | 修正版はディスク上にあるが、プロセスがまだ置き換え前のバイナリを使っている | サービスを再起動します。 |
+| `UNKNOWN` | バージョンを読み取れない、アドバイザリにないブランチ（例：8.6）、またはプレリリースビルド | PHP とベンダーのアドバイザリを手動で確認します。 |
+
+「パッチ済み」と「安全」を混同しないよう、レポートはランタイムごとにさらに 2 つの情報を示します。
+
+- `running`：`yes`、`no`、`stale`（プロセスが置き換え前のコードを実行中）
+- `mitigation`：`none`、`effective`（サービスが値を読み込んでいる）、`pending_restart`（ファイルは配置済みだが、プロセスが変更前に起動）、`not_effective`（ファイルは配置済みだが、サービスが読み込んでいない。エラーとして扱う）
+
+php-safepatch は、サービスごとに実際に使われている設定を読み込みます。実行中の PHP-FPM マスターの `-y` ファイル、systemd ユニットの `-c` と `PHP_INI_SCAN_DIR` が該当します。Windows では、各 IIS FastCGI アプリケーションの `arguments` と `PHPRC`、Apache の `PHPIniDir` を読みます。ヘルスチェックの URL は、変更後も変更前と同じステータスコードを返した場合だけ合格です。Ansible の `apply` は、まだパッチ未適用のホストで停止します。続行するには `safepatch_fail_on_unpatched=false` を指定してください。
 
 ## 緩和設定について
 
@@ -102,7 +110,60 @@ PHP セキュリティチームは、PHP2Shell を完全に修正できるのは
 - `session.upload_progress.enabled=0` は CVE-2026-109619 に対応します。セッションのアップロード進捗機能を使う進捗バーは動かなくなりますが、この機能を使うアプリケーションは多くありません。
 - `memory_limit=-1`（オプトイン）は CVE-2026-109618 の既知の攻撃経路を防ぎます。その代わり、リクエストごとのメモリ上限がなくなります。コンテナ、cgroup、PHP-FPM のメモリ制限と組み合わせて使ってください。`--include-optin` を指定しない限り適用しません。
 - `RLIMIT_AS` や `RLIMIT_DATA` を緩和策として使わないでください。攻撃に必要なメモリ確保の失敗を、かえって引き起こすおそれがあります。
-- リバースプロキシや WAF でリクエストサイズも制限してください。`Content-Length` のないリクエストも対象にする必要があります。
+- リバースプロキシや WAF でリクエストサイズも制限してください。`Content-Length` のないリクエストも対象にする必要があります。方法は次の節を参照してください。
+
+## リバースプロキシ・WAF での遮断
+
+すぐにパッチを適用できない場合は、以下のルールで既知の攻撃リクエストを PHP に届く前に止められます。更新の代わりにはなりません。各ルールは ModSecurity 2.9（OWASP CRS あり）、nginx（stable）、Apache 2.4 で、攻撃を模したリクエストと正常なリクエストを使って確認しました。
+
+| ルール | ModSecurity | nginx | Apache |
+|---|---|---|---|
+| `PHP_SESSION_UPLOAD_PROGRESS` フィールドの遮断（CVE-2026-109619） | すべてのパス | アップロードのないパスのみ | アップロードのないパスのみ |
+| 極端に長いパラメーター名の遮断（CVE-2026-109618） | 可 | 不可 | 不可 |
+| 本文サイズの制限（chunked リクエストを含む） | 可（CRS の既定値） | 可 | 可 |
+
+**ModSecurity（v2・v3、CRS の有無を問わない）。** CRS のルールより先に読み込まれるファイル（例：`REQUEST-899-PHP2SHELL.conf`）に入れてください。`session.upload_progress.name` を既定値から変えている場合は、1 つ目のルールにその値を書いてください。
+
+```apache
+# CVE-2026-109619: block the session upload progress field in multipart requests.
+SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
+    "id:1026101,phase:2,deny,status:403,log,t:none,msg:'PHP2Shell: session upload progress field (CVE-2026-109619)'"
+# CVE-2026-109618: block very long parameter names (the known attack uses one of about 3.5 MB).
+SecRule ARGS_NAMES "@gt 1024" \
+    "id:1026102,phase:2,deny,status:403,log,t:none,t:length,msg:'PHP2Shell: parameter name longer than 1024 bytes (CVE-2026-109618)'"
+```
+
+`SecRequestBodyNoFilesLimit` は小さく（既定値 128 KB）保ち、`SecRequestBodyLimitAction Reject` を維持してください。
+
+**nginx。** nginx はフォームのフィールド名を読めません。そのため、アップロードを受け付けない location で multipart リクエストそのものを遮断します。
+
+```nginx
+client_max_body_size 8m;          # also applies to chunked requests
+
+location / {                      # locations without file uploads
+    if ($content_type ~* "^multipart/form-data") { return 403; }
+    # ... your fastcgi_pass or proxy_pass ...
+}
+```
+
+**ModSecurity なしの Apache。** `%{CONTENT_TYPE}` ではなく `%{HTTP:Content-Type}` を使ってください。Apache の式では `%{CONTENT_TYPE}` はレスポンスの Content-Type を指すため、これを使ったルールは何も遮断しません。
+
+```apache
+LimitRequestBody 8388608          # also applies to chunked requests
+
+<LocationMatch "^/(?!upload)">    # paths without file uploads
+    <If "%{HTTP:Content-Type} =~ m#^multipart/form-data#i">
+        Require all denied
+    </If>
+</LocationMatch>
+```
+
+注意：
+
+- WAF やプロキシが復号されたトラフィックを見られる必要があります。TLS を終端する場所にルールを置いてください。
+- サイズの上限は実際のアップロードサイズから決めてください。小さすぎるとファイルのアップロードが壊れます。
+- nginx と Apache は、アップロードパスではこのフィールドを遮断できません。アップロードパスのあるサーバーから先にパッチを適用するか、そのサーバーでは ModSecurity を使ってください。
+- 本番に適用する前に、ステージング環境で試してください。
 
 ## 環境ごとの注意
 

@@ -54,7 +54,11 @@ EXTRA_PHP=()
 # Runtime table. One index per runtime.
 # ---------------------------------------------------------------------------
 RT_PATH=(); RT_SAPI=(); RT_VERSION=(); RT_BRANCH=(); RT_PKGMGR=(); RT_PKG=(); RT_PKGVER=()
-RT_STATUS=(); RT_REASON=(); RT_ACTION=(); RT_STALE=(); RT_CONTAINER=(); RT_IMAGE=()
+RT_STATUS=(); RT_REASON=(); RT_ACTION=(); RT_CONTAINER=(); RT_IMAGE=()
+# Separate facts per runtime: the binary on disk, the running processes, and the mitigation.
+RT_INSTALLED=(); RT_RUNNING=(); RT_MITIG=()
+# Service configuration actually used (PHP-FPM -y, -c and PHP_INI_SCAN_DIR from the service).
+RT_FPMCONF=(); RT_INI=(); RT_SCANENV=()
 DF_FILE=(); DF_LINE=(); DF_TAG=(); DF_STATUS=(); DF_FIX=()
 IOC_LINES=()
 ACTIONS_DONE=()
@@ -167,25 +171,42 @@ json_str() {
 
 sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
-load_advisory() {  # list keys (mitigate, mitigate_optin, ioc_log) replace the defaults, one rule per line
-  local f="$1" k v seen_m=0 seen_o=0 seen_l=0
+load_advisory() {  # an external advisory starts empty: nothing is inherited from the built-in PHP2Shell data
+  local f="$1" k v n=0 bad=0 x
   [ -r "$f" ] || die "Cannot read advisory file: $f"
-  while IFS='=' read -r k v; do
-    k="${k%%#*}"; k="${k//[[:space:]]/}"
-    [ -z "$k" ] && continue
-    v="${v%$'\r'}"
+  ADV_ID=""; ADV_CVES=""; ADV_FIXED=""; ADV_EOL_BACKPORT=""; ADV_IOC_SINCE=""
+  ADV_MITIGATE=(); ADV_MITIGATE_OPTIN=(); ADV_IOC_LOG=()
+  while IFS= read -r x || [ -n "$x" ]; do
+    n=$((n + 1)); x="${x%$'\r'}"
+    case "$x" in ''|'#'*) continue ;; esac
+    k="${x%%=*}"; v="${x#*=}"; k="${k//[[:space:]]/}"
+    if [ "$k" = "$x" ]; then err "$f:$n: not key=value"; bad=1; continue; fi
     case "$k" in
       id) ADV_ID="$v" ;;
       cves) ADV_CVES="$v" ;;
       fixed) ADV_FIXED="$v" ;;
       eol_backport) ADV_EOL_BACKPORT="$v" ;;
       ioc_since) ADV_IOC_SINCE="$v" ;;
-      mitigate) [ $seen_m -eq 1 ] || ADV_MITIGATE=(); seen_m=1; [ -n "$v" ] && ADV_MITIGATE+=("$v") ;;
-      mitigate_optin) [ $seen_o -eq 1 ] || ADV_MITIGATE_OPTIN=(); seen_o=1; [ -n "$v" ] && ADV_MITIGATE_OPTIN+=("$v") ;;
-      ioc_log) [ $seen_l -eq 1 ] || ADV_IOC_LOG=(); seen_l=1; [ -n "$v" ] && ADV_IOC_LOG+=("$v") ;;
-      *) warn "Unknown advisory key ignored: $k" ;;
+      mitigate) ADV_MITIGATE+=("$v") ;;
+      mitigate_optin) ADV_MITIGATE_OPTIN+=("$v") ;;
+      ioc_log) ADV_IOC_LOG+=("$v") ;;
+      *) err "$f:$n: unknown key '$k'"; bad=1 ;;
     esac
   done <"$f"
+  # Validate. A wrong advisory must stop the run, not change servers in an unexpected way.
+  [[ "$ADV_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { err "$f: 'id' is missing or has characters other than A-Z a-z 0-9 . _ -"; bad=1; }
+  [ -n "${ADV_CVES// /}" ] || { err "$f: 'cves' is missing"; bad=1; }
+  [ -n "${ADV_FIXED// /}" ] || { err "$f: 'fixed' is missing"; bad=1; }
+  for x in $ADV_FIXED; do [[ "$x" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "$f: 'fixed' value '$x' is not X.Y.Z"; bad=1; }; done
+  for x in $ADV_EOL_BACKPORT; do [[ "$x" =~ ^[0-9]+\.[0-9]+$ ]] || { err "$f: 'eol_backport' value '$x' is not X.Y"; bad=1; }; done
+  [ -z "$ADV_IOC_SINCE" ] || [[ "$ADV_IOC_SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { err "$f: 'ioc_since' is not YYYY-MM-DD"; bad=1; }
+  for x in ${ADV_MITIGATE[@]+"${ADV_MITIGATE[@]}"} ${ADV_MITIGATE_OPTIN[@]+"${ADV_MITIGATE_OPTIN[@]}"}; do
+    [[ "$x" =~ ^[A-Za-z0-9_.]+=[^@]*(@[0-9]+\.[0-9]+)?$ ]] || { err "$f: mitigation rule '$x' is not KEY=VALUE[@X.Y]"; bad=1; }
+  done
+  for x in ${ADV_IOC_LOG[@]+"${ADV_IOC_LOG[@]}"}; do
+    [[ "$x" == ?*'|'?* ]] || { err "$f: ioc_log '$x' is not LABEL|REGEX"; bad=1; }
+  done
+  [ "$bad" -eq 0 ] || die "Advisory file $f is not valid. No change was made."
 }
 
 # mitigation_rules BRANCH -> "key value" lines that apply to BRANCH
@@ -355,20 +376,34 @@ php_version_line() {  # php_version_line BIN -> first line of "BIN -v"
   run_t 15 "$1" -n -v 2>/dev/null | head -1
 }
 
+# parse_php_version LINE -> "8.2.10", or "8.5.12RC1" / "8.6.0-dev" for pre-release builds.
+# Distribution suffixes such as "-1ubuntu2.28" are not part of the result.
+parse_php_version() {
+  local re='^PHP ([0-9]+\.[0-9]+\.[0-9]+)(-?(alpha|beta|rc|dev)[0-9]*)?' out=""
+  shopt -s nocasematch
+  [[ "$1" =~ $re ]] && out="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  shopt -u nocasematch
+  printf '%s' "$out"
+}
+ver_base() { [[ "$1" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}"; }
+ver_pre() { local b; b="$(ver_base "$1")"; printf '%s' "${1#"$b"}"; }
+
 add_runtime() {  # path sapi version pkgmgr pkg pkgver stale container image
   local i=${#RT_PATH[@]}
   RT_PATH[i]="$1"; RT_SAPI[i]="$2"; RT_VERSION[i]="$3"; RT_BRANCH[i]=""
   [ -n "$3" ] && RT_BRANCH[i]="$(branch_of "$3")"
-  RT_PKGMGR[i]="$4"; RT_PKG[i]="$5"; RT_PKGVER[i]="$6"; RT_STALE[i]="$7"
+  RT_PKGMGR[i]="$4"; RT_PKG[i]="$5"; RT_PKGVER[i]="$6"
   RT_CONTAINER[i]="$8"; RT_IMAGE[i]="$9"
   RT_STATUS[i]=""; RT_REASON[i]=""; RT_ACTION[i]=""
+  RT_INSTALLED[i]=""; RT_RUNNING[i]="unknown"; RT_MITIG[i]="none"
+  RT_FPMCONF[i]=""; RT_INI[i]=""; RT_SCANENV[i]=""
 }
 
 inspect_binaries() {
   local bin line ver sapi pkg pkgver mgr stale
   for bin in "${CANDIDATES[@]}"; do
     line="$(php_version_line "$bin")"
-    if [[ "$line" =~ ^PHP\ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then ver="${BASH_REMATCH[1]}"; else ver=""; fi
+    ver="$(parse_php_version "$line")"
     if [[ "$line" =~ \((cli|fpm-fcgi|cgi-fcgi|litespeed|embed)\) ]]; then sapi="${BASH_REMATCH[1]}"; else sapi="unknown"; fi
     [ -z "$ver" ] && [ -z "$line" ] && continue   # not a PHP binary (for example a wrapper script)
     pkg="$(pkg_owner "$bin")"; pkgver=""; mgr="none"
@@ -412,7 +447,7 @@ discover_containers() {
     [ -n "$id" ] || continue
     line="$(run_t 20 docker exec "$id" sh -c 'for b in php php-fpm /usr/local/sbin/php-fpm php-cgi; do if command -v "$b" >/dev/null 2>&1; then "$b" -n -v 2>/dev/null | head -1; exit 0; fi; done' 2>/dev/null)"
     [ -n "$line" ] || continue
-    if [[ "$line" =~ ^PHP\ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then ver="${BASH_REMATCH[1]}"; else ver=""; fi
+    ver="$(parse_php_version "$line")"
     if [[ "$line" =~ \((cli|fpm-fcgi|cgi-fcgi)\) ]]; then sapi="${BASH_REMATCH[1]}"; else sapi="unknown"; fi
     add_runtime "container:$name" "$sapi" "$ver" "docker" "" "" 0 "$id" "$image"
   done < <(run_t 15 docker ps --format '{{.ID}} {{.Image}} {{.Names}}' 2>/dev/null)
@@ -422,28 +457,35 @@ discover_containers() {
 # Assessment
 # ---------------------------------------------------------------------------
 assess_one() {
-  local i="$1" v="${RT_VERSION[$1]}" b="${RT_BRANCH[$1]}" fixed low
+  local i="$1" v="${RT_VERSION[$1]}" b="${RT_BRANCH[$1]}" fixed="" low base pre
   low="$(newest_fixed_branch)"
   if [ -z "$v" ]; then
-    RT_STATUS[i]="UNKNOWN"; RT_REASON[i]="Version not readable"; RT_ACTION[i]="Check this runtime manually"
+    RT_STATUS[i]="UNKNOWN"; RT_INSTALLED[i]="UNKNOWN"; RT_REASON[i]="Version not readable"; RT_ACTION[i]="Check this runtime manually"
     return
   fi
-  if fixed="$(fixed_for_branch "$b")" && ver_ge "$v" "$fixed"; then
+  base="$(ver_base "$v")"; pre="$(ver_pre "$v")"
+  fixed="$(fixed_for_branch "$b")"
+  # Only a release that the advisory names as fixed, or a vendor changelog, counts as safe.
+  if [ -n "$fixed" ] && [ -z "$pre" ] && ver_ge "$base" "$fixed"; then
     RT_STATUS[i]="PATCHED"; RT_REASON[i]="Version $v >= $fixed"
   elif [ -n "${RT_PKG[i]}" ] && [ "${RT_PKGMGR[i]}" = "$OS_FAMILY" ] && pkg_changelog_has_cves "${RT_PKG[i]}"; then
     RT_STATUS[i]="PATCHED"; RT_REASON[i]="Vendor backport: changelog of ${RT_PKG[i]} lists all CVEs"
+  elif [ -n "$fixed" ] && [ -n "$pre" ] && [ "$(ver_cmp "$base" "$fixed")" -gt 0 ]; then
+    RT_STATUS[i]="UNKNOWN"; RT_REASON[i]="Pre-release build $v after the fixed release $fixed; the advisory does not say it is fixed"
   elif [ -n "$fixed" ]; then
-    RT_STATUS[i]="VULNERABLE"; RT_REASON[i]="Version $v < $fixed"
+    RT_STATUS[i]="VULNERABLE"; RT_REASON[i]="Version $v is older than the fixed release $fixed"
   elif in_list "$b" $ADV_EOL_BACKPORT; then
     RT_STATUS[i]="VULNERABLE_EOL"; RT_REASON[i]="Branch $b is end-of-life; only vendor or source backports exist"
-  elif [ "$(ver_cmp "$b" "$low")" -lt 0 ]; then
+  elif [ -n "$low" ] && [ "$(ver_cmp "$b" "$low")" -lt 0 ]; then
     RT_STATUS[i]="VULNERABLE_NOFIX"; RT_REASON[i]="Branch $b has no upstream fix"
   else
-    RT_STATUS[i]="PATCHED"; RT_REASON[i]="Branch $b is not in the affected range"
+    RT_STATUS[i]="UNKNOWN"; RT_REASON[i]="Branch $b is not covered by advisory $ADV_ID"
   fi
+  RT_INSTALLED[i]="${RT_STATUS[i]}"
 
   case "${RT_STATUS[i]}" in
     PATCHED) RT_ACTION[i]="None" ;;
+    UNKNOWN) RT_ACTION[i]="Check the vendor and PHP advisories for $v manually" ;;
     *)
       case "${RT_PKGMGR[i]}" in
         debian|rhel) RT_ACTION[i]="Upgrade ${RT_PKG[i]} inside branch $b; mitigate if no fixed package exists" ;;
@@ -451,7 +493,7 @@ assess_one() {
         *)           RT_ACTION[i]="Not package-managed: rebuild $b from patched source or vendor build; mitigate now" ;;
       esac ;;
   esac
-  if [ "${RT_STALE[i]}" = 1 ]; then
+  if [ "${RT_RUNNING[i]}" = stale ]; then
     RT_REASON[i]="${RT_REASON[i]}; a process still runs a replaced (deleted) binary"
     RT_STATUS[i]="RESTART_REQUIRED"
     RT_ACTION[i]="Restart the service that runs this binary"
@@ -550,8 +592,9 @@ check_iocs() {
     ioc_add "process $pid ($user) '$cmd' started by $pcomm ($ppid)"
   done
 
-  # PHP files changed after the reference date in web roots.
-  local roots=(/var/www /srv/www /srv/http /usr/share/nginx/html /var/lib/nginx/html "${WEB_ROOTS[@]}")
+  # PHP files changed after the reference date in web roots (only if the advisory gives a date).
+  [ -n "$ADV_IOC_SINCE" ] || return 0
+  local roots=(/var/www /srv/www /srv/http /usr/share/nginx/html /var/lib/nginx/html ${WEB_ROOTS[@]+"${WEB_ROOTS[@]}"})
   shopt -s nullglob
   roots+=(/home/*/public_html /home/*/www)
   shopt -u nullglob
@@ -584,9 +627,10 @@ ioc_count() {  # counts real indicators (lines that do not start with "info:")
 print_report() {
   local i
   printf '\nphp-safepatch %s  advisory %s (%s)  host %s  os %s\n' "$SAFEPATCH_VERSION" "$ADV_ID" "$ADV_CVES" "$(hostname 2>/dev/null)" "$OS_FAMILY"
-  printf '%-18s %-15s %-9s %-46s %s\n' "STATUS" "SAPI" "VERSION" "RUNTIME" "PACKAGE"
+  printf '%-18s %-15s %-11s %-8s %-16s %-40s %s\n' "STATUS" "SAPI" "VERSION" "RUNNING" "MITIGATION" "RUNTIME" "PACKAGE"
   for i in "${!RT_PATH[@]}"; do
-    printf '%-18s %-15s %-9s %-46s %s\n' "${RT_STATUS[i]}" "${RT_SAPI[i]}" "${RT_VERSION[i]:--}" "${RT_PATH[i]}" \
+    printf '%-18s %-15s %-11s %-8s %-16s %-40s %s\n' "${RT_STATUS[i]}" "${RT_SAPI[i]}" "${RT_VERSION[i]:--}" \
+      "${RT_RUNNING[i]}" "${RT_MITIG[i]}" "${RT_PATH[i]}" \
       "${RT_PKG[i]:+${RT_PKG[i]} ${RT_PKGVER[i]}}${RT_IMAGE[i]:+image ${RT_IMAGE[i]}}"
     is_bad_status "${RT_STATUS[i]}" && printf '%-18s -> %s. %s\n' "" "${RT_REASON[i]}" "${RT_ACTION[i]}"
   done
@@ -624,11 +668,13 @@ write_json() {
     first=1
     for i in "${!RT_PATH[@]}"; do
       [ $first -eq 1 ] || printf ','; first=0
-      printf '{"path":%s,"sapi":%s,"version":%s,"branch":%s,"manager":%s,"package":%s,"package_version":%s,"container":%s,"image":%s,"status":%s,"reason":%s,"action":%s}' \
+      printf '{"path":%s,"sapi":%s,"version":%s,"branch":%s,"manager":%s,"package":%s,"package_version":%s,"container":%s,"image":%s,"status":%s,"installed":%s,"running":%s,"mitigation":%s,"config":{"fpm_conf":%s,"php_ini":%s,"scan_dir_env":%s,"unit":%s},"reason":%s,"action":%s}' \
         "$(json_str "${RT_PATH[i]}")" "$(json_str "${RT_SAPI[i]}")" "$(json_str "${RT_VERSION[i]}")" "$(json_str "${RT_BRANCH[i]}")" \
         "$(json_str "${RT_PKGMGR[i]}")" "$(json_str "${RT_PKG[i]}")" "$(json_str "${RT_PKGVER[i]}")" \
         "$(json_str "${RT_CONTAINER[i]}")" "$(json_str "${RT_IMAGE[i]}")" \
-        "$(json_str "${RT_STATUS[i]}")" "$(json_str "${RT_REASON[i]}")" "$(json_str "${RT_ACTION[i]}")"
+        "$(json_str "${RT_STATUS[i]}")" "$(json_str "${RT_INSTALLED[i]}")" "$(json_str "${RT_RUNNING[i]}")" "$(json_str "${RT_MITIG[i]}")" \
+        "$(json_str "${RT_FPMCONF[i]}")" "$(json_str "${RT_INI[i]}")" "$(json_str "${RT_SCANENV[i]}")" "$(json_str "${RT_UNIT[i]:-}")" \
+        "$(json_str "${RT_REASON[i]}")" "$(json_str "${RT_ACTION[i]}")"
     done
     printf '],"dockerfiles":['
     first=1
@@ -688,18 +734,22 @@ http_code() {
 declare -A HEALTH_BEFORE=()
 health_before() { local u; for u in "${HEALTH_URLS[@]}"; do HEALTH_BEFORE[$u]="$(http_code "$u")"; info "Health before: $u -> ${HEALTH_BEFORE[$u]}"; done; }
 
-health_after() {  # returns 1 if a URL that worked before fails now
+health_after() {  # returns 1 if a URL does not give the same status code as before the change
   local u now before rc=0
   for u in "${HEALTH_URLS[@]}"; do
     before="${HEALTH_BEFORE[$u]:-000}"
-    for _ in 1 2 3 4 5; do
+    if [ "$before" = "000" ] || [ "${before:0:1}" = "5" ]; then
+      warn "Health URL $u already failed before the change ($before); it cannot verify this run"
+      continue
+    fi
+    for _ in 1 2 3 4 5; do   # services can need a few seconds after a restart
       now="$(http_code "$u")"
-      [ "$now" != "000" ] && [ "${now:0:1}" != "5" ] && break
+      [ "$now" = "$before" ] && break
       sleep 3
     done
     info "Health after: $u -> $now (before $before)"
-    if [ "$before" != "000" ] && [ "${before:0:1}" != "5" ] && { [ "$now" = "000" ] || [ "${now:0:1}" = "5" ]; }; then
-      err "Health check failed: $u was $before, now $now"; rc=1
+    if [ "$now" != "$before" ]; then
+      err "Health check failed: $u gave $before before the change and $now after it"; rc=1
     fi
   done
   return $rc
@@ -725,8 +775,12 @@ patch_debian_branch() {  # returns 0 if packages were upgraded
     run_t 600 apt-get update -qq >>"${LOG_FILE:-/dev/null}" 2>&1 || warn "apt-get update reported errors"
     APT_UPDATED=1
   fi
-  sim="$(LC_ALL=C apt-get -s install --only-upgrade "${pkgs[@]}" 2>&1)"
+  local simrc
+  sim="$(LC_ALL=C apt-get -s install --only-upgrade "${pkgs[@]}" 2>&1)"; simrc=$?
   printf '%s\n' "$sim" >>"${LOG_FILE:-/dev/null}"
+  if [ "$simrc" -ne 0 ]; then
+    err "apt-get could not simulate the upgrade for branch $b (exit $simrc); see the log. Not patching."; return 1
+  fi
   while IFS= read -r line; do
     if [[ "$line" =~ ^Remv\ ([^ ]+) ]]; then err "Simulation removes ${BASH_REMATCH[1]}. Not patching branch $b."; bad=1; fi
     [[ "$line" =~ ^Inst\ ([^ ]+)\ .*\(([^ ]+)\  ]] || continue
@@ -763,29 +817,68 @@ rhel_branch_packages() {  # packages of the same PHP build as the owner package
   fi
 }
 
+# check_rpm_transaction BRANCH OUTPUT -- reads the transaction table that "dnf/yum upgrade --assumeno"
+# prints. Sets RPM_TX_COUNT. Returns 1 if the transaction removes, downgrades or replaces a package,
+# or touches a PHP core package of another branch.
+RPM_TX_COUNT=0
+check_rpm_transaction() {
+  local b="$1" out="$2" line section="" name ver carry="" bad=0 f1 f2 f3
+  RPM_TX_COUNT=0
+  while IFS= read -r line; do
+    case "$line" in
+      [A-Za-z]*:)                                                   # section header at column 0
+        carry=""
+        case "$line" in
+          *[Rr]epositor*|Transaction*) section="" ;;
+          *[Mm]odule*) err "Transaction changes module streams ($line). Not patching branch $b."; bad=1; section="" ;;
+          Upgrad*|Updat*|Install*|Reinstall*|Remov*|Eras*|Downgrad*|Obsolet*|Replac*) section="$line" ;;
+          *) section="" ;;
+        esac
+        continue ;;
+      Transaction*) section=""; continue ;;
+    esac
+    [ -n "$section" ] || continue
+    case "$line" in " "*) ;; *) continue ;; esac
+    read -r f1 f2 f3 _ <<<"$line"
+    [ -n "$f1" ] || continue
+    [ "$f1" = "replacing" ] && continue                             # dnf5 detail line under an upgrade
+    if [ -z "$f2" ]; then carry="$f1"; continue; fi                  # yum wraps long names to their own line
+    if [ -n "$carry" ]; then name="$carry"; ver="$f2"; carry=""; else name="$f1"; ver="$f3"; fi
+    ver="${ver#*:}"
+    RPM_TX_COUNT=$((RPM_TX_COUNT + 1))
+    case "$section" in
+      *[Rr]emov*|*[Dd]owngrad*|*[Oo]bsolet*|*[Ee]ras*|*[Rr]eplac*)
+        err "Transaction would ${section%:} $name. Not patching branch $b."; bad=1; continue ;;
+    esac
+    case "$name" in *pecl*|*pear*) continue ;; esac                 # own version numbers
+    if [[ "$name" =~ ^(php|php-.+|php[0-9]+-php.*|ea-php[0-9]+.*)$ ]]; then
+      if [[ "$name" =~ ^(ea-)?php([0-9])([0-9]+)- ]] && [ "${BASH_REMATCH[2]}.${BASH_REMATCH[3]}" != "$b" ]; then
+        err "Transaction installs $name (branch ${BASH_REMATCH[2]}.${BASH_REMATCH[3]}). Not patching branch $b."; bad=1
+      elif [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && [ "$(branch_of "${BASH_REMATCH[0]}")" != "$b" ]; then
+        err "Transaction moves $name to $ver (other branch). Not patching branch $b."; bad=1
+      fi
+    fi
+  done <<<"$out"
+  return $bad
+}
+
 patch_rhel_branch() {
-  local b="$1" owner="$2" pkgs line name newv bad=0 count=0 tool=""
+  local b="$1" owner="$2" pkgs tool="" sim rc
   mapfile -t pkgs < <(rhel_branch_packages "$owner")
   [ "${#pkgs[@]}" -gt 0 ] || return 1
   if have dnf; then tool=dnf; elif have yum; then tool=yum; else warn "No dnf or yum"; return 1; fi
-  local upd
-  if [ "$tool" = dnf ]; then
-    upd="$(run_t 600 dnf -q repoquery --upgrades --latest-limit 1 --qf '%{name} %{version}' "${pkgs[@]}" 2>>"${LOG_FILE:-/dev/null}")"
-  else
-    upd="$(run_t 600 yum -q check-update "${pkgs[@]}" 2>/dev/null | awk 'NF==3 && $1 ~ /\./ {n=$1; sub(/\.[^.]+$/,"",n); v=$2; sub(/^[0-9]+:/,"",v); sub(/-.*/,"",v); print n, v}')"
+  # Simulate the real transaction, with dependencies, before anything is installed.
+  sim="$(LC_ALL=C run_t 900 "$tool" upgrade --assumeno "${pkgs[@]}" 2>&1)"; rc=$?
+  printf '%s\n' "$sim" >>"${LOG_FILE:-/dev/null}"
+  if grep -qiE '^(Nothing to do|No packages marked for update)' <<<"$sim"; then
+    info "No newer packages for branch $b in the configured repositories"; return 1
   fi
-  printf '%s\n' "$upd" >>"${LOG_FILE:-/dev/null}"
-  while read -r name newv; do
-    [ -n "$name" ] || continue
-    count=$((count + 1))
-    case "$name" in *pecl*|*pear*|*-pdlib|*-libvirt*|*-phpiredis) continue ;; esac   # own version numbers
-    if [[ "$newv" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && [ "$(branch_of "${BASH_REMATCH[0]}")" != "$b" ]; then
-      err "Repository offers $name $newv (other branch). Not patching branch $b. Pin the module stream or the Remi repository first."
-      bad=1
-    fi
-  done <<<"$upd"
-  [ "$bad" -eq 0 ] || return 1
-  [ "$count" -gt 0 ] || { info "No newer packages for branch $b in the configured repositories"; return 1; }
+  if ! grep -qiE 'Operation aborted|Exiting on user command|Is this ok' <<<"$sim"; then
+    err "$tool could not simulate the upgrade for branch $b (exit $rc); see the log. Not patching."; return 1
+  fi
+  check_rpm_transaction "$b" "$sim" || return 1
+  local count="$RPM_TX_COUNT"
+  [ "$count" -gt 0 ] || { err "$tool simulation for branch $b listed no packages; see the log. Not patching."; return 1; }
   rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' "${pkgs[@]}" >>"$RUN_DIR/packages.before" 2>/dev/null
   info "Upgrading $count package(s) for branch $b with $tool"
   if run_t 1800 "$tool" -y -q upgrade "${pkgs[@]}" >>"${LOG_FILE:-/dev/null}" 2>&1; then
@@ -800,7 +893,7 @@ patch_rhel_branch() {
 # Mitigation (FR-7)
 # ---------------------------------------------------------------------------
 MARK_BEGIN=""; MARK_END=""; INI_NAME=""; APACHE_CONF_NAME=""
-CHANGED_FPM_BINS=()
+CHANGED_FPM_IDX=()
 CHANGED_APACHE=0
 
 set_adv_names() {  # file names and markers come from the advisory id, so advisories do not collide
@@ -837,8 +930,34 @@ write_file_if_changed() {  # write_file_if_changed PATH CONTENT
   return 0
 }
 
-scan_dir_of() {  # scan_dir_of BIN -> "Scan this dir for additional .ini files"
-  run_t 15 "$1" -i 2>/dev/null | awk -F'=> ' '/^Scan this dir for additional \.ini files/ {print $2; exit}'
+rt_php() {  # rt_php INDEX ARGS... -- runs a runtime with the -c and PHP_INI_SCAN_DIR of its service
+  local i="$1"; shift
+  local -a pre=() opt=()
+  [ -n "${RT_SCANENV[i]}" ] && pre=(env "PHP_INI_SCAN_DIR=${RT_SCANENV[i]}")
+  [ -n "${RT_INI[i]}" ] && opt=(-c "${RT_INI[i]}")
+  run_t 30 ${pre[@]+"${pre[@]}"} "${RT_PATH[i]}" ${opt[@]+"${opt[@]}"} "$@"
+}
+
+fpm_test() {  # fpm_test INDEX -- "php-fpm -t" with the configuration that the service really uses
+  local i="$1"
+  if [ -n "${RT_FPMCONF[i]}" ]; then rt_php "$i" -t -y "${RT_FPMCONF[i]}"; else rt_php "$i" -t; fi
+}
+
+php_info() {  # php_info INDEX -- "php -i" as "key => local => master" lines, also for php-cgi (HTML output)
+  local i="$1"
+  if [ "${RT_SAPI[i]}" = "cgi-fcgi" ]; then
+    rt_php "$i" -q -i 2>/dev/null \
+      | sed -E 's#<tr><td class="e">([^<]*)</td><td class="v">([^<]*)</td>(<td class="v">([^<]*)</td>)?</tr>#\1 => \2 => \4#' \
+      | awk -F' => ' -v OFS=' => ' 'NF >= 2 { for (k = 1; k <= NF; k++) gsub(/^[ \t]+|[ \t]+$/, "", $k); if ($NF == "") NF--; print }'
+  else
+    rt_php "$i" -i 2>/dev/null
+  fi
+}
+
+scan_dir_of() {  # scan_dir_of INDEX -> "Scan this dir for additional .ini files" (first dir)
+  local d
+  d="$(php_info "$1" | awk -F' => ' '/^Scan this dir for additional \.ini files/ {print $2; exit}')"
+  [ -n "$d" ] && [ "$d" != "(none)" ] && printf '%s' "${d%%:*}"
 }
 
 ini_dirs_for_branch() {  # all conf.d dirs used by the runtimes of branch B
@@ -849,14 +968,136 @@ ini_dirs_for_branch() {  # all conf.d dirs used by the runtimes of branch B
     fi
     for i in "${!RT_PATH[@]}"; do
       [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] && [ "${RT_SAPI[i]}" != "apache2handler" ] || continue
-      d="$(scan_dir_of "${RT_PATH[i]}")"
-      [ -n "$d" ] && [ "$d" != "(none)" ] && printf '%s\n' "${d%%:*}"
+      d="$(scan_dir_of "$i")"
+      [ -n "$d" ] && printf '%s\n' "$d"
     done
   } | sort -u
 }
 
-fpm_main_conf() {  # fpm_main_conf BIN -> path of php-fpm.conf
+fpm_default_conf() {  # fpm_default_conf BIN -> php-fpm.conf that the binary uses without -y
   run_t 15 "$1" -t 2>&1 | sed -n 's/.*configuration file \(.*\) test is successful.*/\1/p' | head -1
+}
+
+# ---------------------------------------------------------------------------
+# Running processes: which runtimes run, and which run a binary that was replaced on disk
+# ---------------------------------------------------------------------------
+declare -A RUN_STATE=() RUN_START=()
+note_proc() {  # note_proc PATH START_EPOCH
+  local p="$1" st="$2" state=yes
+  case "$p" in *" (deleted)") p="${p% (deleted)}"; state=stale ;; esac
+  [ "${RUN_STATE[$p]:-}" = stale ] || RUN_STATE[$p]="$state"
+  if [ -n "$st" ] && { [ -z "${RUN_START[$p]:-}" ] || [ "$st" -lt "${RUN_START[$p]}" ]; }; then RUN_START[$p]="$st"; fi
+}
+
+scan_processes() {
+  RUN_STATE=(); RUN_START=()
+  local pid exe st m
+  for pid in /proc/[0-9]*; do
+    exe="$(readlink -- "$pid/exe" 2>/dev/null)" || continue
+    st="$(stat -c %Y "$pid" 2>/dev/null)"     # start time of the process
+    note_proc "$exe" "$st"
+    case "$(basename -- "${exe% (deleted)}")" in
+      apache2|httpd|httpd.worker|httpd.event)  # mod_php is a library inside the web server
+        while IFS= read -r m; do note_proc "$m" "$st"; done \
+          < <(awk '$6 ~ /libphp/ {p = $6; for (k = 7; k <= NF; k++) p = p " " $k; print p}' "$pid/maps" 2>/dev/null | sort -u) ;;
+    esac
+  done
+}
+
+set_running() {  # set_running INDEX -- yes, no, stale (old code still runs) or unknown (containers)
+  local i="$1"
+  if [ -n "${RT_CONTAINER[i]}" ]; then RT_RUNNING[i]="unknown"; return; fi
+  RT_RUNNING[i]="${RUN_STATE[${RT_PATH[i]}]:-no}"
+}
+
+# ---------------------------------------------------------------------------
+# Service configuration: the files that the running service really reads
+# ---------------------------------------------------------------------------
+RT_UNIT=()
+service_config() {  # service_config INDEX -- fills RT_FPMCONF, RT_INI, RT_SCANENV, RT_UNIT
+  local i="$1" bin="${RT_PATH[$1]}" pid exe t u ex argv envs
+  local re_y='(^| )(-y|--fpm-config)[= ]([^ ]+)' re_c='(^| )(-c|--php-ini)[= ]([^ ]+)' re_s='(^| )PHP_INI_SCAN_DIR=([^ ]+)'
+  RT_UNIT[i]=""
+  [ -z "${RT_CONTAINER[i]}" ] || return 0
+  [ "${RT_SAPI[i]}" = "fpm-fcgi" ] || return 0
+  # 1. A running master shows its configuration file in its process title.
+  for pid in /proc/[0-9]*; do
+    exe="$(readlink -- "$pid/exe" 2>/dev/null)" || continue
+    [ "${exe% (deleted)}" = "$bin" ] || continue
+    t="$(tr '\0' ' ' <"$pid/cmdline" 2>/dev/null)"
+    if [[ "$t" =~ master\ process\ \(([^\)]+)\) ]]; then RT_FPMCONF[i]="${BASH_REMATCH[1]}"; break; fi
+  done
+  # 2. The systemd unit gives -y, -c and PHP_INI_SCAN_DIR.
+  if have systemctl && [ -d /run/systemd/system ]; then
+    while read -r u; do
+      ex="$(systemctl show -p ExecStart --value "$u" 2>/dev/null)"
+      [[ "$ex" == *"$bin"* ]] || continue
+      argv="${ex#*argv[]=}"; argv="${argv%% ;*}"
+      [ -z "${RT_FPMCONF[i]}" ] && [[ "$argv" =~ $re_y ]] && RT_FPMCONF[i]="${BASH_REMATCH[3]}"
+      [[ "$argv" =~ $re_c ]] && RT_INI[i]="${BASH_REMATCH[3]}"
+      envs="$(systemctl show -p Environment --value "$u" 2>/dev/null)"
+      [[ "$envs" =~ $re_s ]] && RT_SCANENV[i]="${BASH_REMATCH[2]}"
+      RT_UNIT[i]="$u"
+      break
+    done < <(systemctl list-units --type=service --all --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -Ei 'php|fpm')
+  fi
+  # 3. Default of the binary.
+  [ -n "${RT_FPMCONF[i]}" ] || RT_FPMCONF[i]="$(fpm_default_conf "$bin")"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Mitigation state: is it there, does the runtime really use it, and is it loaded?
+# ---------------------------------------------------------------------------
+norm_ini() {  # norm_ini VALUE -> 1 / 0 for booleans, the value otherwise
+  local v; v="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/^ *//; s/ *$//')"
+  case "$v" in on|1|true|yes) echo 1 ;; off|0|false|no|"") echo 0 ;; *) printf '%s\n' "$v" ;; esac
+}
+
+apache_mitigation_conf() {  # path of the Apache mitigation file for this OS (may not exist)
+  if [ -d /etc/apache2/conf-available ]; then printf '%s' "/etc/apache2/conf-enabled/$APACHE_CONF_NAME"
+  elif [ -d /etc/httpd/conf.d ]; then printf '%s' "/etc/httpd/conf.d/zz-$APACHE_CONF_NAME"; fi
+}
+
+mitigation_state() {  # mitigation_state INDEX -> RT_MITIG: none, effective, pending_restart, not_effective
+  local i="$1" b="${RT_BRANCH[$1]}" files=() f d k v got info newest=0 m bad=0 pools=0 blocked=0
+  if [ -n "${RT_CONTAINER[i]}" ] || [ -z "$b" ]; then RT_MITIG[i]="unknown"; return; fi
+  local rules; rules="$(mitigation_rules "$b")"
+  case "${RT_SAPI[i]}" in
+    apache2handler)
+      f="$(apache_mitigation_conf)"; [ -n "$f" ] && [ -e "$f" ] && files+=("$f") ;;
+    *)
+      d="$(scan_dir_of "$i")"; [ -n "$d" ] && [ -f "$d/$INI_NAME" ] && files+=("$d/$INI_NAME")
+      if [ "${RT_SAPI[i]}" = "fpm-fcgi" ] && [ -n "${RT_FPMCONF[i]}" ]; then
+        while read -r f; do
+          pools=$((pools + 1))
+          grep -qxF "$MARK_BEGIN" "$f" 2>/dev/null && { blocked=$((blocked + 1)); files+=("$f"); }
+        done < <(fpm_pool_files "${RT_FPMCONF[i]}" | sort -u)
+      fi ;;
+  esac
+  if [ "${#files[@]}" -eq 0 ]; then RT_MITIG[i]="none"; return; fi
+  if [ -z "$rules" ]; then RT_MITIG[i]="effective"; return; fi
+  # Check the values that the runtime really reads (same -c and PHP_INI_SCAN_DIR as its service).
+  if [ "${RT_SAPI[i]}" != "apache2handler" ]; then
+    info="$(php_info "$i")"
+    while read -r k v; do
+      [ -n "$k" ] || continue
+      got="$(awk -F' => ' -v k="$k" '$1 == k {print $2; exit}' <<<"$info")"
+      [ "$(norm_ini "$got")" = "$(norm_ini "$v")" ] || bad=1
+    done <<<"$rules"
+    # PHP-FPM pools with an admin-locked block enforce the values even when conf.d is not read.
+    [ "$bad" -eq 1 ] && [ "$pools" -gt 0 ] && [ "$blocked" -eq "$pools" ] && bad=0
+  fi
+  if [ "$bad" -eq 1 ]; then RT_MITIG[i]="not_effective"; return; fi
+  for f in "${files[@]}"; do
+    m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$newest" ] && newest="$m"
+  done
+  # Processes that started before the newest change still use the old configuration.
+  if [ "${RT_RUNNING[i]}" != "no" ] && [ -n "${RUN_START[${RT_PATH[i]}]:-}" ] && [ "${RUN_START[${RT_PATH[i]}]}" -lt "$newest" ]; then
+    RT_MITIG[i]="pending_restart"
+  else
+    RT_MITIG[i]="effective"
+  fi
 }
 
 fpm_pool_files() {  # fpm_pool_files MAIN_CONF
@@ -872,10 +1113,10 @@ fpm_pool_files() {  # fpm_pool_files MAIN_CONF
   done < <(sed -n 's/^[[:space:]]*include[[:space:]]*=[[:space:]]*//p' "$conf")
 }
 
-patch_pool_file() {  # adds the block at the end of every non-global section
-  local f="$1" b="$2" tmp blk
+patch_pool_file() {  # patch_pool_file FILE BRANCH [remove] -- adds (or removes) the block in every non-global section
+  local f="$1" b="$2" mode="${3:-add}" tmp blk
   tmp="$(mktemp)"; blk="$(mktemp)"
-  fpm_block "$b" >"$blk"
+  if [ "$mode" = remove ]; then : >"$blk"; else fpm_block "$b" >"$blk"; fi
   awk -v bfile="$blk" -v mb="$MARK_BEGIN" -v me="$MARK_END" '
     BEGIN { while ((getline l < bfile) > 0) block = block l "\n" }
     $0 == mb { skip = 1; next }
@@ -927,8 +1168,14 @@ ${lines}</IfModule>"
   return 0
 }
 
+mark_fpm_changed() { in_list "$1" ${CHANGED_FPM_IDX[@]+"${CHANGED_FPM_IDX[@]}"} || CHANGED_FPM_IDX+=("$1"); }
+
 mitigate_branch() {  # mitigate_branch BRANCH
-  local b="$1" d i conf f
+  local b="$1" d i f
+  if [ -z "$(mitigation_rules "$b")" ]; then
+    warn "Advisory $ADV_ID has no mitigation rule for branch $b. Nothing to mitigate."
+    return 0
+  fi
   for d in $(ini_dirs_for_branch "$b"); do
     [ -d "$d" ] || continue
     if write_file_if_changed "$d/$INI_NAME" "$(ini_body "$b")"; then
@@ -939,31 +1186,56 @@ mitigate_branch() {  # mitigate_branch BRANCH
     [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] || continue
     case "${RT_SAPI[i]}" in
       fpm-fcgi)
-        conf="$(fpm_main_conf "${RT_PATH[i]}")"
-        [ -n "$conf" ] || { warn "Cannot find php-fpm.conf for ${RT_PATH[i]} (config test failed?)"; continue; }
+        [ -n "${RT_FPMCONF[i]}" ] || { err "Cannot find the php-fpm.conf that ${RT_PATH[i]} uses"; continue; }
         while read -r f; do
           if patch_pool_file "$f" "$b"; then
-            info "FPM pool $f: admin-locked mitigation"; ACTIONS_DONE+=("fpm-pool:$f")
-            in_list "${RT_PATH[i]}" "${CHANGED_FPM_BINS[@]}" || CHANGED_FPM_BINS+=("${RT_PATH[i]}")
+            info "FPM pool $f: admin-locked mitigation"; ACTIONS_DONE+=("fpm-pool:$f"); mark_fpm_changed "$i"
           fi
-        done < <(fpm_pool_files "$conf" | sort -u)
+        done < <(fpm_pool_files "${RT_FPMCONF[i]}" | sort -u)
         ;;
       apache2handler) apache_mitigation "$b" ;;
     esac
   done
 }
 
-unmitigate_branch() {  # removes php-safepatch files for a branch that is now patched
-  local b="$1" d
+unmitigate_branch() {  # removes every php-safepatch mitigation of a branch that is now patched
+  local b="$1" d i f c
   for d in $(ini_dirs_for_branch "$b"); do
     if [ -f "$d/$INI_NAME" ]; then backup_file "$d/$INI_NAME"; rm -f "$d/$INI_NAME"; ACTIONS_DONE+=("removed:$d/$INI_NAME"); fi
   done
+  for i in "${!RT_PATH[@]}"; do
+    [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] || continue
+    case "${RT_SAPI[i]}" in
+      fpm-fcgi)
+        [ -n "${RT_FPMCONF[i]}" ] || continue
+        while read -r f; do
+          if patch_pool_file "$f" "$b" remove; then
+            ACTIONS_DONE+=("removed:fpm-pool:$f"); mark_fpm_changed "$i"
+          fi
+        done < <(fpm_pool_files "${RT_FPMCONF[i]}" | sort -u)
+        ;;
+      apache2handler)
+        for c in "/etc/apache2/conf-enabled/$APACHE_CONF_NAME" "/etc/apache2/conf-available/$APACHE_CONF_NAME" "/etc/httpd/conf.d/zz-$APACHE_CONF_NAME"; do
+          if [ -e "$c" ] || [ -L "$c" ]; then backup_file "$c"; rm -f -- "$c"; ACTIONS_DONE+=("removed:$c"); CHANGED_APACHE=1; fi
+        done ;;
+    esac
+  done
+}
+
+has_mitigation() {  # has_mitigation BRANCH -- true if php-safepatch files of this advisory exist for the branch
+  local b="$1" i
+  for i in "${!RT_PATH[@]}"; do
+    [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] || continue
+    [ "${RT_MITIG[i]}" != "none" ] && [ "${RT_MITIG[i]}" != "unknown" ] && return 0
+  done
+  local d; for d in $(ini_dirs_for_branch "$b"); do [ -f "$d/$INI_NAME" ] && return 0; done
+  return 1
 }
 
 config_tests() {  # returns 1 if a changed config does not pass its test
-  local bin rc=0
-  for bin in "${CHANGED_FPM_BINS[@]}"; do
-    if ! run_t 30 "$bin" -t >>"${LOG_FILE:-/dev/null}" 2>&1; then err "Config test failed: $bin -t"; rc=1; fi
+  local i rc=0
+  for i in ${CHANGED_FPM_IDX[@]+"${CHANGED_FPM_IDX[@]}"}; do
+    if ! fpm_test "$i" >>"${LOG_FILE:-/dev/null}" 2>&1; then err "Config test failed: ${RT_PATH[i]} -t -y ${RT_FPMCONF[i]}"; rc=1; fi
   done
   if [ "$CHANGED_APACHE" -eq 1 ]; then
     local ctl=""
@@ -986,8 +1258,17 @@ restart_services() {  # restart_services "BRANCHES" -- restarts PHP and web serv
   if have systemctl && [ -d /run/systemd/system ]; then
     mapfile -t units < <(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' \
       | grep -E '^(php[0-9.]*-fpm|php-fpm|php[0-9]+-php-fpm|rh-php[0-9]+-php-fpm|ea-php[0-9]+-php-fpm|plesk-php[0-9]+-fpm|apache2|httpd|lsws|lshttpd)\.service$')
+    # Units found from the runtimes themselves (custom unit names) are restarted too.
+    local i
+    for i in "${!RT_PATH[@]}"; do
+      [ -n "${RT_UNIT[i]:-}" ] || continue
+      for b in $branches; do
+        [ "${RT_BRANCH[i]}" = "$b" ] && ! in_list "${RT_UNIT[i]}" "${units[@]}" && units+=("${RT_UNIT[i]}")
+      done
+    done
     for u in "${units[@]}"; do
       want=0
+      in_list "$u" ${RT_UNIT[@]+"${RT_UNIT[@]}"} && want=1
       case "$u" in
         apache2.service|httpd.service) [ "$HAS_MOD_PHP" -eq 1 ] || [ "$CHANGED_APACHE" -eq 1 ] && want=1 ;;
         lsws.service|lshttpd.service) want=1 ;;
@@ -1017,9 +1298,23 @@ do_scan() {
   discover_containers
   local i
   for i in "${!RT_SAPI[@]}"; do [ "${RT_SAPI[i]}" = "apache2handler" ] && HAS_MOD_PHP=1; done
+  scan_processes
+  for i in "${!RT_PATH[@]}"; do set_running "$i"; service_config "$i"; done
   assess_all
+  for i in "${!RT_PATH[@]}"; do mitigation_state "$i"; done
   scan_dockerfiles
   check_iocs
+}
+
+refresh_state() {  # reads processes, versions and mitigation state again (after changes and restarts)
+  local i
+  scan_processes
+  for i in "${!RT_PATH[@]}"; do
+    [ -z "${RT_CONTAINER[i]}" ] || continue
+    set_running "$i"
+    assess_one "$i"
+    mitigation_state "$i"
+  done
 }
 
 confirm() {
@@ -1035,50 +1330,66 @@ confirm() {
 
 do_apply() {
   [ "$(id -u)" -eq 0 ] || [ "${PHP_SAFEPATCH_TEST_NONROOT:-0}" = 1 ] || die "apply must run as root"
-  local i b todo_branches=() patched_branches=() mitig_branches=() status_before
+  local i b todo_branches=() patched_branches=() mitig_branches=() cleanup_branches=() bad_b
   for i in "${!RT_PATH[@]}"; do
     [ -z "${RT_CONTAINER[i]}" ] && [ -n "${RT_BRANCH[i]}" ] || continue
+    b="${RT_BRANCH[i]}"
     if is_bad_status "${RT_STATUS[i]}" || [ "$OPT_MITIGATE" = "always" ]; then
-      in_list "${RT_BRANCH[i]}" "${todo_branches[@]}" || todo_branches+=("${RT_BRANCH[i]}")
+      in_list "$b" ${todo_branches[@]+"${todo_branches[@]}"} || todo_branches+=("$b")
     fi
   done
+  # Branches where every runtime is patched and runs the patched code, but an old mitigation is
+  # still in place (for example memory_limit=-1): remove it in auto mode.
+  if [ "$OPT_MITIGATE" = "auto" ]; then
+    for i in "${!RT_PATH[@]}"; do
+      [ -z "${RT_CONTAINER[i]}" ] && [ -n "${RT_BRANCH[i]}" ] || continue
+      b="${RT_BRANCH[i]}"
+      in_list "$b" ${todo_branches[@]+"${todo_branches[@]}"} ${cleanup_branches[@]+"${cleanup_branches[@]}"} && continue
+      has_mitigation "$b" && cleanup_branches+=("$b")
+    done
+  fi
   local df_todo=0
   for i in "${!DF_FILE[@]}"; do [ "${DF_STATUS[i]}" = "VULNERABLE" ] && [ -n "${DF_FIX[i]}" ] && df_todo=1; done
   [ "$OPT_FIX_DOCKERFILES" -eq 1 ] || df_todo=0
 
-  if [ "${#todo_branches[@]}" -eq 0 ] && [ "$df_todo" -eq 0 ]; then
+  if [ "${#todo_branches[@]}" -eq 0 ] && [ "${#cleanup_branches[@]}" -eq 0 ] && [ "$df_todo" -eq 0 ]; then
     info "Nothing to apply on this host."
     return 0
   fi
   print_report
-  printf '\nPlanned: branches [%s]%s. Patch: %s. Mitigate: %s. Restart: %s.\n' "${todo_branches[*]}" \
+  printf '\nPlanned: branches [%s]%s%s. Patch: %s. Mitigate: %s. Restart: %s.\n' "${todo_branches[*]-}" \
+    "$([ "${#cleanup_branches[@]}" -gt 0 ] && echo " + remove old mitigation for [${cleanup_branches[*]}]")" \
     "$([ "$df_todo" -eq 1 ] && echo ' + Dockerfile tags')" "$([ "$OPT_NO_PATCH" -eq 1 ] && echo no || echo 'same branch only')" \
     "$OPT_MITIGATE$([ "$OPT_OPTIN" -eq 1 ] && echo ' +opt-in rules')" "$([ "$OPT_NO_RESTART" -eq 1 ] && echo no || echo yes)"
   confirm "Apply these changes on $(hostname)?" || { info "Cancelled."; return 0; }
 
   # Preflight: a PHP-FPM whose configuration already fails its test would not start again after
   # a restart. Leave such a branch untouched and report it.
-  local keep=() bad_b
-  for b in "${todo_branches[@]}"; do
+  local keep=() all_b=()
+  all_b=(${todo_branches[@]+"${todo_branches[@]}"} ${cleanup_branches[@]+"${cleanup_branches[@]}"})
+  for b in ${all_b[@]+"${all_b[@]}"}; do
     bad_b=0
     for i in "${!RT_PATH[@]}"; do
       [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] && [ "${RT_SAPI[i]}" = "fpm-fcgi" ] || continue
-      if ! run_t 30 "${RT_PATH[i]}" -t >>"${LOG_FILE:-/dev/null}" 2>&1; then
-        err "Config test fails before any change: ${RT_PATH[i]} -t. Fix it first; branch $b is not changed."
+      if [ -z "${RT_FPMCONF[i]}" ] || ! fpm_test "$i" >>"${LOG_FILE:-/dev/null}" 2>&1; then
+        err "Config test fails before any change: ${RT_PATH[i]} -t ${RT_FPMCONF[i]:+-y ${RT_FPMCONF[i]}}. Fix it first; branch $b is not changed."
         bad_b=1
       fi
     done
     [ "$bad_b" -eq 0 ] && keep+=("$b")
   done
-  todo_branches=("${keep[@]}")
-  [ "${#todo_branches[@]}" -gt 0 ] || [ "$df_todo" -eq 1 ] || return 0
+  local t=() c=()
+  for b in ${todo_branches[@]+"${todo_branches[@]}"}; do in_list "$b" ${keep[@]+"${keep[@]}"} && t+=("$b"); done
+  for b in ${cleanup_branches[@]+"${cleanup_branches[@]}"}; do in_list "$b" ${keep[@]+"${keep[@]}"} && c+=("$b"); done
+  todo_branches=(${t[@]+"${t[@]}"}); cleanup_branches=(${c[@]+"${c[@]}"})
+  [ "${#todo_branches[@]}" -gt 0 ] || [ "${#cleanup_branches[@]}" -gt 0 ] || [ "$df_todo" -eq 1 ] || return 0
 
   health_before
   snapshot_modules before
 
   # 1. Patch inside the branch.
   if [ "$OPT_NO_PATCH" -eq 0 ]; then
-    for b in "${todo_branches[@]}"; do
+    for b in ${todo_branches[@]+"${todo_branches[@]}"}; do
       local owner="" mgr=""
       for i in "${!RT_PATH[@]}"; do
         [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] && [ -n "${RT_PKG[i]}" ] && { owner="${RT_PKG[i]}"; mgr="${RT_PKGMGR[i]}"; break; }
@@ -1091,7 +1402,7 @@ do_apply() {
     done
   fi
 
-  # 2. Assess again with the new package versions.
+  # 2. Assess the binaries on disk again. Processes are checked after the restart (step 7).
   if [ "${#patched_branches[@]}" -gt 0 ]; then
     for i in "${!RT_PATH[@]}"; do
       [ -z "${RT_CONTAINER[i]}" ] || continue
@@ -1100,62 +1411,72 @@ do_apply() {
         RT_PKGVER[i]="$(pkg_version "${RT_PKG[i]}")"
         [[ "${RT_PKGVER[i]}" =~ ^([0-9]+:)?([0-9]+\.[0-9]+\.[0-9]+) ]] && RT_VERSION[i]="${BASH_REMATCH[2]}"
       else
-        local line; line="$(php_version_line "${RT_PATH[i]}")"
-        [[ "$line" =~ ^PHP\ ([0-9]+\.[0-9]+\.[0-9]+) ]] && RT_VERSION[i]="${BASH_REMATCH[1]}"
+        RT_VERSION[i]="$(parse_php_version "$(php_version_line "${RT_PATH[i]}")")"
         [ -n "${RT_PKG[i]}" ] && RT_PKGVER[i]="$(pkg_version "${RT_PKG[i]}")"
       fi
       if [ "$(branch_of "${RT_VERSION[i]}")" != "${RT_BRANCH[i]}" ]; then
         err "Branch changed for ${RT_PATH[i]}: ${RT_BRANCH[i]} -> ${RT_VERSION[i]}. Run: php-safepatch.sh rollback --run-id $(basename "$RUN_DIR")"
       fi
-      RT_STALE[i]=0
       assess_one "$i"
     done
   fi
 
-  # 3. Mitigate what is still vulnerable (or everything with --mitigate always).
+  # 3. Mitigate what is still vulnerable on disk (or everything with --mitigate always).
+  #    Remove the mitigation of branches that are now patched.
   if [ "$OPT_MITIGATE" != "never" ]; then
-    for b in "${todo_branches[@]}"; do
-      status_before="PATCHED"
+    for b in ${todo_branches[@]+"${todo_branches[@]}"}; do
+      local still_bad=0
       for i in "${!RT_PATH[@]}"; do
-        [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] && is_bad_status "${RT_STATUS[i]}" && status_before="BAD"
+        [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] || continue
+        case "${RT_INSTALLED[i]}" in PATCHED) ;; *) still_bad=1 ;; esac
       done
-      if [ "$status_before" = "BAD" ] || [ "$OPT_MITIGATE" = "always" ]; then
+      if [ "$still_bad" -eq 1 ] || [ "$OPT_MITIGATE" = "always" ]; then
         mitig_branches+=("$b"); mitigate_branch "$b"
-        for i in "${!RT_PATH[@]}"; do
-          [ "${RT_BRANCH[i]}" = "$b" ] && [ -z "${RT_CONTAINER[i]}" ] && is_bad_status "${RT_STATUS[i]}" \
-            && RT_REASON[i]="${RT_REASON[i]}; interim mitigation applied (not a complete fix)"
-        done
-      elif in_list "$b" "${patched_branches[@]}"; then
+      elif [ "$OPT_MITIGATE" = "auto" ]; then
         unmitigate_branch "$b"
       fi
     done
+    for b in ${cleanup_branches[@]+"${cleanup_branches[@]}"}; do unmitigate_branch "$b"; done
   fi
 
   # 4. Config tests. Restore on failure.
   if ! config_tests; then
     err "Configuration test failed. Restoring the files that this run changed."
     restore_files "$RUN_DIR"
-    CHANGED_FPM_BINS=(); CHANGED_APACHE=0
+    CHANGED_FPM_IDX=(); CHANGED_APACHE=0; mitig_branches=()
     ACTIONS_DONE+=("rollback:config-files")
   fi
 
   # 5. Dockerfiles.
   [ "$OPT_FIX_DOCKERFILES" -eq 1 ] && fix_dockerfiles
 
-  # 6. Restart and verify.
-  if [ "${#patched_branches[@]}" -gt 0 ] || [ "${#CHANGED_FPM_BINS[@]}" -gt 0 ] || [ "$CHANGED_APACHE" -eq 1 ] \
-     || grep -q '^CREATED .*\.ini$\|^MODIFIED .*\.ini$' "$RUN_DIR/manifest" 2>/dev/null; then
-    restart_services "${todo_branches[*]}"
+  # 6. Restart.
+  local restart_b=(${todo_branches[@]+"${todo_branches[@]}"} ${cleanup_branches[@]+"${cleanup_branches[@]}"})
+  if [ "${#patched_branches[@]}" -gt 0 ] || [ "${#CHANGED_FPM_IDX[@]}" -gt 0 ] || [ "$CHANGED_APACHE" -eq 1 ] \
+     || grep -q '\.ini$' "$RUN_DIR/manifest" 2>/dev/null; then
+    restart_services "${restart_b[*]-}"
   fi
+
+  # 7. Verify: processes, mitigation, extensions, health.
+  refresh_state
   snapshot_modules after
   local verify_ok=1
   compare_modules || verify_ok=0
   health_after || verify_ok=0
+  for i in "${!RT_PATH[@]}"; do
+    [ -z "${RT_CONTAINER[i]}" ] || continue
+    in_list "${RT_BRANCH[i]}" ${mitig_branches[@]+"${mitig_branches[@]}"} || continue
+    case "${RT_MITIG[i]}" in
+      not_effective) err "Mitigation is written but ${RT_PATH[i]} does not use it. Check how its service loads php.ini." ;;
+      none) [ -n "$(mitigation_rules "${RT_BRANCH[i]}")" ] && err "No mitigation file reaches ${RT_PATH[i]}." ;;
+    esac
+  done
   if [ "$verify_ok" -eq 0 ]; then
     err "Verification failed. Restoring configuration files and restarting."
     restore_files "$RUN_DIR"
     CHANGED_APACHE=1
-    restart_services "${todo_branches[*]}"
+    restart_services "${restart_b[*]-}"
+    refresh_state
     if [ -s "$RUN_DIR/packages.before" ]; then
       err "Packages were upgraded. To downgrade them, run: php-safepatch.sh rollback --run-id $(basename "$RUN_DIR")"
     fi

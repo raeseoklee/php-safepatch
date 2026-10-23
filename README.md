@@ -93,7 +93,15 @@ Exit codes: `0` = all runtimes patched and no indicator, `1` = a runtime is not 
 | `VULNERABLE` | A fixed release of the same branch exists | `apply` |
 | `VULNERABLE_EOL` | 7.4 to 8.1: no official release | Use a distribution or LTS backport if one exists. Otherwise mitigate and plan an upgrade with application tests. |
 | `VULNERABLE_NOFIX` | 7.3 or older: no fix exists | Mitigate, isolate from the internet, plan an upgrade |
-| `RESTART_REQUIRED` | A process still runs a replaced binary | Restart the service |
+| `RESTART_REQUIRED` | The fix is on disk, but a process still runs the replaced binary | Restart the service |
+| `UNKNOWN` | Version not readable, branch not in the advisory (for example 8.6), or a pre-release build | Check the PHP and vendor advisories manually |
+
+The report also shows two more fields for each runtime, so that "patched" and "safe" are not mixed:
+
+- `running`: `yes`, `no`, or `stale` (a process runs the old code).
+- `mitigation`: `none`, `effective` (the service reads the values), `pending_restart` (written, but processes started before the change), or `not_effective` (written, but the service does not read it; this is an error).
+
+php-safepatch reads the configuration that each service really uses: the `-y` file of a running PHP-FPM master, `-c` and `PHP_INI_SCAN_DIR` from its systemd unit, and on Windows the `arguments` and `PHPRC` of each IIS FastCGI application and Apache `PHPIniDir`. A health URL passes only if it gives the same status code after the change as before. With Ansible, `apply` stops at the first host that is still not patched (set `safepatch_fail_on_unpatched=false` to continue).
 
 ## About the mitigations
 
@@ -102,7 +110,60 @@ The PHP security team says that only the update fully fixes PHP2Shell. The mitig
 - `session.upload_progress.enabled=0` addresses CVE-2026-109619. It disables upload progress bars that use the session upload progress feature. Few applications use this feature.
 - `memory_limit=-1` (opt-in) blocks the known path of CVE-2026-109618. It also removes the per-request memory cap. Use it only together with a container, cgroup or PHP-FPM memory limit. php-safepatch does not apply it unless you give `--include-optin`.
 - Do not use `RLIMIT_AS` or `RLIMIT_DATA` as a mitigation. They can cause the allocation failures that the attack needs.
-- Also limit the request size at the reverse proxy or WAF, including requests without `Content-Length`.
+- Also limit the request size at the reverse proxy or WAF, including requests without `Content-Length`. See the next section.
+
+## Block at the reverse proxy or WAF
+
+If you cannot patch at once, these rules stop the known attack requests before they reach PHP. They do not replace the update. We tested each rule with attack-shaped and normal requests on ModSecurity 2.9 with OWASP CRS, nginx (stable) and Apache 2.4.
+
+| Rule | ModSecurity | nginx | Apache |
+|---|---|---|---|
+| Block the `PHP_SESSION_UPLOAD_PROGRESS` field (CVE-2026-109619) | All paths | Paths without uploads only | Paths without uploads only |
+| Block very long parameter names (CVE-2026-109618) | Yes | No | No |
+| Limit the body size, also for chunked requests | Yes (CRS default) | Yes | Yes |
+
+**ModSecurity (v2 or v3, with or without CRS).** Put the rules in a file that loads before the CRS rules, for example `REQUEST-899-PHP2SHELL.conf`. If `session.upload_progress.name` is not the default, use your value in the first rule.
+
+```apache
+# CVE-2026-109619: block the session upload progress field in multipart requests.
+SecRule ARGS_NAMES "@streq PHP_SESSION_UPLOAD_PROGRESS" \
+    "id:1026101,phase:2,deny,status:403,log,t:none,msg:'PHP2Shell: session upload progress field (CVE-2026-109619)'"
+# CVE-2026-109618: block very long parameter names (the known attack uses one of about 3.5 MB).
+SecRule ARGS_NAMES "@gt 1024" \
+    "id:1026102,phase:2,deny,status:403,log,t:none,t:length,msg:'PHP2Shell: parameter name longer than 1024 bytes (CVE-2026-109618)'"
+```
+
+Keep `SecRequestBodyNoFilesLimit` small (the default is 128 KB) and `SecRequestBodyLimitAction Reject`.
+
+**nginx.** nginx cannot read the form field names, so it blocks multipart requests on the locations that do not accept uploads.
+
+```nginx
+client_max_body_size 8m;          # also applies to chunked requests
+
+location / {                      # locations without file uploads
+    if ($content_type ~* "^multipart/form-data") { return 403; }
+    # ... your fastcgi_pass or proxy_pass ...
+}
+```
+
+**Apache without ModSecurity.** Use `%{HTTP:Content-Type}`, not `%{CONTENT_TYPE}`. In Apache expressions, `%{CONTENT_TYPE}` is the content type of the response, so a rule that uses it blocks nothing.
+
+```apache
+LimitRequestBody 8388608          # also applies to chunked requests
+
+<LocationMatch "^/(?!upload)">    # paths without file uploads
+    <If "%{HTTP:Content-Type} =~ m#^multipart/form-data#i">
+        Require all denied
+    </If>
+</LocationMatch>
+```
+
+Notes:
+
+- The WAF or proxy must see the decrypted traffic. Put the rules where TLS ends.
+- Choose the size limit from your real uploads. A limit that is too small breaks file uploads.
+- nginx and Apache cannot block the field on upload paths. Patch the servers that have upload paths first, or use ModSecurity there.
+- Test the rules on a staging server before production.
 
 ## Environment notes
 
