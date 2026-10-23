@@ -24,6 +24,7 @@ The unit suite uses fake PHP binaries, a fake `dpkg-query` and a fake `apt-get`.
 - Version rules: a branch that is not in the advisory (8.6.0) and a pre-release after the fix (8.5.13-dev) are `UNKNOWN`; a pre-release of the fix (8.5.12RC1) is `VULNERABLE`; a distribution suffix is not a pre-release.
 - A runtime that does not read the mitigation is `not_effective` and the run fails.
 - PHP-FPM pools: a marked block with a wrong value, or a later pool line that sets the value back, is `not_effective`.
+- PHP-FPM include order: `include=z.conf` (0) then `include=a.conf` (1) is `not_effective`; the reverse order is `effective`; a nested include that sets the value back is `not_effective`.
 - One PHP-FPM binary with two systemd units (`--fpm-config A`, `-y B -c php.ini`): two runtimes, both pools mitigated, both units restarted, no shifted fields.
 - In auto mode, a patched branch loses all old mitigation, also the PHP-FPM pool blocks.
 - A health URL that changes from 200 to 404 fails the run and restores the files.
@@ -104,6 +105,7 @@ The Windows suite downloads an old official PHP build (default 8.3.35, NTS, x64)
 - Function checks without PHP: the assessment, health and argument functions are taken from the script by its syntax tree and tested directly (8.6.0, RC and dev builds, 200 -> 404).
 - Service recovery: when the second Apache service fails to stop, the first one starts again; after an exception in the step, both start again.
 - After a restore, the report reads the version from disk again (8.3.36 -> 8.3.35 is `VULNERABLE`).
+- When the version cannot be read, the result is `UNKNOWN`, not the earlier `PATCHED`.
 - In auto mode, a patched installation loses its old mitigation; advisory files start empty and are validated.
 
 ```powershell

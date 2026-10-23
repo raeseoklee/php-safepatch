@@ -82,6 +82,10 @@ function Set-MitigationState($rt) { }
 $rt = @{ path = 'C:\php'; version = '8.3.36'; branch = '8.3'; build = 'nts-vs16-x64'; status = 'PATCHED'; installed = 'PATCHED'; reason = ''; action = '' }
 Update-State $rt
 Check 'Update-State reads the version again (8.3.36 -> 8.3.35 after a restore)' ($rt.version -eq '8.3.35' -and $rt.status -eq 'VULNERABLE')
+function Get-PhpInfo($d) { return @{ Version = ''; Build = '' } }   # the binary cannot run
+$rt = @{ path = 'C:\php'; version = '8.3.36'; branch = '8.3'; build = 'nts-vs16-x64'; status = 'PATCHED'; installed = 'PATCHED'; reason = ''; action = '' }
+Update-State $rt
+Check 'a failed version read gives UNKNOWN, not the old PATCHED' ($rt.version -eq '' -and $rt.status -eq 'UNKNOWN')
 Remove-Item Function:\Start-Sleep, Function:\Info, Function:\Warn, Function:\Err, Function:\Stop-Service, Function:\Start-Service, `
     Function:\Get-ApacheServices, Function:\Get-DirProcesses, Function:\Get-PhpInfo, Function:\Set-Running, Function:\Set-MitigationState
 $Adv = Join-Path $Repo 'advisories\php2shell.conf'

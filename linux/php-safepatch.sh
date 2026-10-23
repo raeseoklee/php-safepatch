@@ -1117,7 +1117,7 @@ mitigation_state() {  # mitigation_state INDEX -> RT_MITIG: none, effective, pen
         while read -r f; do
           pools=$((pools + 1))
           grep -qxF "$MARK_BEGIN" "$f" 2>/dev/null && { blocked=$((blocked + 1)); files+=("$f"); }
-        done < <(fpm_pool_files "${RT_FPMCONF[i]}" | sort -u)
+        done < <(fpm_pool_files "${RT_FPMCONF[i]}")
       fi ;;
   esac
   if [ "${#files[@]}" -eq 0 ]; then RT_MITIG[i]="none"; return; fi
@@ -1161,28 +1161,59 @@ mitigation_state() {  # mitigation_state INDEX -> RT_MITIG: none, effective, pen
   fi
 }
 
-fpm_pool_files() {  # fpm_pool_files MAIN_CONF
-  local conf="$1" inc dir f
-  [ -r "$conf" ] || return 0
-  grep -q '^[[:space:]]*\[[^]]*\]' "$conf" && awk '/^[[:space:]]*\[/{s=$0; gsub(/[][ \t]/,"",s); if (s!="global") {found=1}} END{exit !found}' "$conf" && printf '%s\n' "$conf"
+# PHP-FPM reads "include" at the place where it stands: the included files come before the lines
+# that follow the include, and an included file can include more files. Globs expand in the order
+# of glob(3) (byte order in the C locale). These functions follow the same order.
+fpm_include_targets() {  # fpm_include_targets FILE VALUE -> files of one include= value, in reading order
+  local conf="$1" inc="$2" dir f
+  inc="${inc%%;*}"; inc="${inc//\"/}"; inc="$(printf '%s' "$inc" | sed 's/[[:space:]]*$//')"
+  inc="${inc//\$\{prefix\}/\/usr}"
   dir="$(dirname -- "$conf")"
-  while read -r inc; do
-    inc="${inc%%;*}"; inc="${inc//\"/}"; inc="$(printf '%s' "$inc" | sed 's/[[:space:]]*$//')"
-    inc="${inc//\$\{prefix\}/\/usr}"
-    case "$inc" in /*) ;; *) inc="$dir/${inc#./}" ;; esac
-    for f in $inc; do [ -f "$f" ] && printf '%s\n' "$f"; done
-  done < <(sed -n 's/^[[:space:]]*include[[:space:]]*=[[:space:]]*//p' "$conf")
+  case "$inc" in /*) ;; *) inc="$dir/${inc#./}" ;; esac
+  local LC_ALL=C
+  for f in $inc; do [ -f "$f" ] && printf '%s\n' "$f"; done
+}
+
+fpm_conf_stream() {  # fpm_conf_stream FILE [DEPTH] -> the configuration lines in the order PHP-FPM reads them
+  local f="$1" depth="${2:-0}" line t
+  [ -r "$f" ] && [ "$depth" -lt 10 ] || return 0      # depth limit: no endless include loop
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*include[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      while IFS= read -r t; do fpm_conf_stream "$t" $((depth + 1)); done < <(fpm_include_targets "$f" "${BASH_REMATCH[1]}")
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$f"
+}
+
+fpm_conf_files() {  # fpm_conf_files FILE [DEPTH] -> FILE and all files it includes, in reading order
+  local f="$1" depth="${2:-0}" line t
+  [ -r "$f" ] && [ "$depth" -lt 10 ] || return 0
+  printf '%s\n' "$f"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*include[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    while IFS= read -r t; do fpm_conf_files "$t" $((depth + 1)); done < <(fpm_include_targets "$f" "${BASH_REMATCH[1]}")
+  done <"$f"
+}
+
+fpm_pool_files() {  # fpm_pool_files MAIN_CONF -> files that open a pool section, in reading order, each once
+  local f
+  declare -A seen=()
+  while IFS= read -r f; do
+    [ -n "${seen[$f]:-}" ] && continue
+    seen[$f]=1
+    awk '/^[[:space:]]*\[/ { s = $0; gsub(/[][ \t]/, "", s); if (s != "global") found = 1 } END { exit !found }' "$f" && printf '%s\n' "$f"
+  done < <(fpm_conf_files "$1")
 }
 
 # fpm_pool_values CONF KEY... -> "pool<TAB>key<TAB>value" for every pool and key. The value is the one
 # that PHP-FPM applies: the last php_admin_value/php_admin_flag, else the last php_value/php_flag,
-# else empty (the pool does not set the key, so conf.d and php.ini apply).
+# else empty (the pool does not set the key, so conf.d and php.ini apply). "Last" is in reading
+# order, includes expanded in place (fpm_conf_stream).
 fpm_pool_values() {
   local conf="$1"; shift
-  local files=()
-  mapfile -t files < <(fpm_pool_files "$conf" | sort -u)
-  [ "${#files[@]}" -gt 0 ] || return 0
-  awk -v keys="$*" '
+  [ -r "$conf" ] || return 0
+  fpm_conf_stream "$conf" | awk -v keys="$*" '
     BEGIN { n = split(keys, K, " "); for (j = 1; j <= n; j++) want[K[j]] = 1 }
     /^[ \t]*\[[^]]+\][ \t]*$/ { s = $0; gsub(/[][ \t]/, "", s); pool = (s == "global") ? "" : s; if (pool != "") pools[pool] = 1; next }
     pool != "" && /^[ \t]*php_(admin_)?(value|flag)\[/ {
@@ -1200,7 +1231,7 @@ fpm_pool_values() {
         if ((p SUBSEP k) in A) v = A[p SUBSEP k]; else if ((p SUBSEP k) in P) v = P[p SUBSEP k]
         print p "\t" k "\t" v
       }
-    }' "${files[@]}"
+    }'
 }
 
 patch_pool_file() {  # patch_pool_file FILE BRANCH [remove] -- adds (or removes) the block in every non-global section
@@ -1281,7 +1312,7 @@ mitigate_branch() {  # mitigate_branch BRANCH
           if patch_pool_file "$f" "$b"; then
             info "FPM pool $f: admin-locked mitigation"; ACTIONS_DONE+=("fpm-pool:$f"); mark_fpm_changed "$i"
           fi
-        done < <(fpm_pool_files "${RT_FPMCONF[i]}" | sort -u)
+        done < <(fpm_pool_files "${RT_FPMCONF[i]}")
         ;;
       apache2handler) apache_mitigation "$b" ;;
     esac
@@ -1302,7 +1333,7 @@ unmitigate_branch() {  # removes every php-safepatch mitigation of a branch that
           if patch_pool_file "$f" "$b" remove; then
             ACTIONS_DONE+=("removed:fpm-pool:$f"); mark_fpm_changed "$i"
           fi
-        done < <(fpm_pool_files "${RT_FPMCONF[i]}" | sort -u)
+        done < <(fpm_pool_files "${RT_FPMCONF[i]}")
         ;;
       apache2handler)
         for c in "/etc/apache2/conf-enabled/$APACHE_CONF_NAME" "/etc/apache2/conf-available/$APACHE_CONF_NAME" "/etc/httpd/conf.d/zz-$APACHE_CONF_NAME"; do

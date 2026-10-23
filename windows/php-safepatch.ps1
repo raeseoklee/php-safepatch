@@ -834,8 +834,10 @@ function Invoke-Scan {
 
 function Update-State($rt) {
     # Read the version from disk again: a restore or a rollback can have put the old binaries back.
+    # If the binary cannot run, the old version must not stay: the result is UNKNOWN, not PATCHED.
     $info = Get-PhpInfo $rt.path
-    if ($info.Version) { $rt.version = $info.Version; $rt.branch = (Get-Branch $info.Version) }
+    $rt.version = [string]$info.Version
+    $rt.branch = Get-Branch $rt.version
     if ($info.Build) { $rt.build = $info.Build }
     Set-Running $rt
     Set-Assessment $rt

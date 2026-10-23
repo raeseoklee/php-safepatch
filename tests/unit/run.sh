@@ -154,6 +154,23 @@ printf 'php_admin_flag[session.upload_progress.enabled] = on\n' >>"$T/fpm/pool.d
 bash "$S" scan --no-docker --no-ioc --quiet --state-dir "$T/state" --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/over.json" >/dev/null 2>&1
 check_eq "a later admin line that sets the value back is not_effective" not_effective "$(rt_field "$T/over.json" /php-fpm8.4 mitigation)"
 
+section "PHP-FPM: include order is the reading order (not sorted), nested includes count"
+setup
+printf 'session.upload_progress.enabled = 0\n' >"$INI"
+mkdir -p "$T/fpm/inc/deeper"
+printf '[w]\nphp_admin_value[session.upload_progress.enabled] = 0\n' >"$T/fpm/inc/z.conf"
+printf '[w]\nphp_admin_value[session.upload_progress.enabled] = 1\n' >"$T/fpm/inc/a.conf"
+printf '[global]\ninclude=%s/fpm/inc/z.conf\ninclude=%s/fpm/inc/a.conf\n' "$T" "$T" >"$T/fpm/php-fpm.conf"
+bash "$S" scan --no-docker --no-ioc --quiet --state-dir "$T/state" --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/order1.json" >/dev/null 2>&1
+check_eq "z.conf (0) then a.conf (1): the final value is 1, not_effective" not_effective "$(rt_field "$T/order1.json" /php-fpm8.4 mitigation)"
+printf '[global]\ninclude=%s/fpm/inc/a.conf\ninclude=%s/fpm/inc/z.conf\n' "$T" "$T" >"$T/fpm/php-fpm.conf"
+bash "$S" scan --no-docker --no-ioc --quiet --state-dir "$T/state" --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/order2.json" >/dev/null 2>&1
+check_eq "a.conf (1) then z.conf (0): the final value is 0, effective" effective "$(rt_field "$T/order2.json" /php-fpm8.4 mitigation)"
+printf '[w]\nphp_admin_value[session.upload_progress.enabled] = 0\ninclude=%s/fpm/inc/deeper/*.conf\n' "$T" >"$T/fpm/inc/z.conf"
+printf 'php_admin_value[session.upload_progress.enabled] = 1\n' >"$T/fpm/inc/deeper/late.conf"
+bash "$S" scan --no-docker --no-ioc --quiet --state-dir "$T/state" --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/order3.json" >/dev/null 2>&1
+check_eq "a nested include that sets the value back: not_effective" not_effective "$(rt_field "$T/order3.json" /php-fpm8.4 mitigation)"
+
 section "One PHP-FPM binary with two services (-y A and -y B): two runtimes"
 setup
 for x in A B; do

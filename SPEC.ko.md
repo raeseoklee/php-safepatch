@@ -85,10 +85,10 @@ php-safepatch는 런타임마다 네 가지 사실을 따로 기록한다. 하�
   - Linux: SAPI별 `conf.d` 파일, 실제로 쓰는 PHP-FPM 설정의 풀마다 `php_admin_value` 줄, mod_php용 Apache 설정의 `php_admin_value` 줄을 쓴다.
   - Windows: FR-2에서 찾은 `php.ini`마다 표식으로 감싼 블록을 넣는다. 블록은 첫 `[PATH=]`·`[HOST=]` 섹션 앞에 둔다. 그런 섹션 뒤의 값은 해당 경로나 호스트에만 적용되기 때문이다.
   - 변경 후에는 각 서비스가 읽는 방식 그대로 값을 다시 읽는다. 값을 받지 못한 런타임이 있으면 오류(`not_effective`)로 처리한다.
-  - PHP-FPM은 풀마다 키별 최종값을 계산한다. 마지막 `php_admin_value`/`php_admin_flag`가 우선이고, 없으면 마지막 `php_value`/`php_flag`, 그것도 없으면 `php.ini`와 `conf.d`의 값이다. 모든 풀의 최종값이 advisory 값과 같아야 한다. 블록의 표식만으로는 적용된 것으로 보지 않는다.
+  - PHP-FPM은 풀마다 키별 최종값을 계산한다. 마지막 `php_admin_value`/`php_admin_flag`가 우선이고, 없으면 마지막 `php_value`/`php_flag`, 그것도 없으면 `php.ini`와 `conf.d`의 값이다. 모든 풀의 최종값이 advisory 값과 같아야 한다. 블록의 표식만으로는 적용된 것으로 보지 않는다. "마지막"은 PHP-FPM이 읽는 순서를 따른다. `include`는 그 줄이 있는 위치에서 읽고(글롭은 C 로케일 바이트 순서), 중첩 include도 따라간다.
 - **FR-9 완화 제거**: `--mitigate auto`에서 한 브랜치의 런타임이 모두 `PATCHED`가 되면, 그 advisory로 넣은 완화를 모두 지운다. `conf.d` 파일, PHP-FPM 풀 블록, Apache 파일, Windows `php.ini` 블록이 대상이다.
 - **FR-10 백업과 롤백**: 파일을 바꾸기 전에 실행 ID별 디렉터리로 복사한다. 설정 검사, 확장 모듈 검사, 헬스 체크 중 하나라도 실패하면 파일을 자동으로 되돌린다. 패키지는 이전 버전을 기록해 두고 `rollback` 명령으로 다시 설치한다. Windows에서는 업데이트하는 PHP 디렉터리를 통째로 복사해 둔다.
-- **FR-11 재시작과 재확인**: 바뀐 런타임을 쓰는 서비스(PHP-FPM, Apache, IIS 애플리케이션 풀)를 재시작한다. FR-2에서 찾은 systemd 유닛도 포함한다. 그다음 디스크의 버전, 프로세스, 완화 상태를 다시 읽고 다시 판정한다. 자동 복구가 일어났다면 보고서에는 복구된 버전이 나온다. `--no-restart`를 줬거나 재시작할 수 없으면 `status`는 `RESTART_REQUIRED`, 완화는 `pending_restart`로 남는다.
+- **FR-11 재시작과 재확인**: 바뀐 런타임을 쓰는 서비스(PHP-FPM, Apache, IIS 애플리케이션 풀)를 재시작한다. FR-2에서 찾은 systemd 유닛도 포함한다. 그다음 디스크의 버전, 프로세스, 완화 상태를 다시 읽고 다시 판정한다. 자동 복구가 일어났다면 보고서에는 복구된 버전이 나온다. 버전을 읽을 수 없으면 `UNKNOWN`으로 판정하고, 이전 값을 그대로 두지 않는다. `--no-restart`를 줬거나 재시작할 수 없으면 `status`는 `RESTART_REQUIRED`, 완화는 `pending_restart`로 남는다.
 - **FR-12 Windows 서비스 복구**: Windows는 사용 중인 파일을 잠그므로, 바이너리를 업데이트할 때 IIS나 Apache를 멈춘다. 첫 서비스를 멈추는 순간부터 마지막 파일을 복사할 때까지를 하나의 `try`/`finally`로 묶는다. 서비스는 멈추는 즉시 목록에 기록한다. `finally`에서 일부만 복사된 파일을 되돌리고, 뒤쪽 서비스의 중지가 실패하거나 예외가 나도 이미 멈춘 서비스를 모두 다시 시작한다. 롤백할 때의 디렉터리 복원도 같은 방식을 쓴다.
 - **FR-13 검증**: 변경 전후의 확장 모듈 목록(`php -m`)을 비교한다. 사라진 모듈이 있으면 실패로 처리한다. `--health-url`을 주면 URL마다 변경 후의 HTTP 상태 코드가 변경 전과 같아야 한다. 변경 전부터 실패하던 URL은 판단에 쓰지 않는다.
 - **FR-14 침해 지표 점검**: 읽기 전용으로 advisory의 로그 패턴, PHP·웹 워커가 띄운 셸, `ioc_since` 이후 웹 디렉터리에서 바뀐 PHP 파일(흔한 웹셸 패턴 포함)을 확인한다.
