@@ -128,6 +128,15 @@ powershell -ExecutionPolicy Bypass -File tests\windows\run.ps1 -OldVersion 8.2.3
 4. 변경 후 헬스 체크 URL이 HTTP 500을 내도록 만듭니다(예: 완화 설정이 켜지면 실패하는 파일). php-safepatch가 파일을 되돌리는지 확인합니다.
 5. 이 가상 머신들을 대상으로 Ansible 플레이북을 실행합니다. 먼저 `scan`, 그다음 `-e safepatch_mode=apply` 순서입니다.
 
+### Rocky KVM 자동 테스트
+
+`sudo bash tests/vm/run-rocky9.sh`는 일회용 Rocky 9 VM을 부팅하고 Rocky 9.5 보관 저장소의
+서명된 PHP 8.2.25 패키지를 설치합니다. 실제 dnf 업그레이드의 브랜치 유지, 두 PHP-FPM
+서비스의 실제 systemd 재시작, HTTP로 읽은 완화 값, HTTP 500 발생 시 자동 설정 복구를
+검증합니다. 로그와 보고서는 `tests/out/vm-rocky9-<타임스탬프>/`에 저장합니다.
+의존성과 WSL 실행법은 [VM 테스트 안내](tests/vm/README.ko.md)를 참고하세요. Remi, yum,
+Debian 서비스 통합과 패키지 다운그레이드는 별도 VM 검증이 필요합니다.
+
 ## 릴리스 전 확인
 
 - `shellcheck -S warning linux/php-safepatch.sh tests/*.sh tests/*/*.sh` 결과가 깨끗해야 합니다.

@@ -128,6 +128,15 @@ Before you use `apply` in production, run it on one virtual machine for each OS 
 4. Make the health URL return HTTP 500 after the change (for example, with a file that fails when the mitigation is active). Check that php-safepatch restores the files.
 5. Run the Ansible playbook against these machines: first `scan`, then `-e safepatch_mode=apply`.
 
+### Automated Rocky KVM test
+
+`sudo bash tests/vm/run-rocky9.sh` boots a disposable Rocky 9 VM and installs signed PHP 8.2.25
+packages from the Rocky 9.5 vault. It verifies an actual same-branch dnf upgrade, real systemd
+restarts of two PHP-FPM services, HTTP mitigation values, and automatic configuration recovery
+after an HTTP 500. Logs and reports are saved under `tests/out/vm-rocky9-<timestamp>/`.
+See [the VM test instructions](tests/vm/README.md) for dependencies and WSL usage. Remi, yum,
+Debian service integration and package downgrades still need separate VM coverage.
+
 ## Before a release
 
 - `shellcheck -S warning linux/php-safepatch.sh tests/*.sh tests/*/*.sh` has no findings.

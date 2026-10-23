@@ -128,6 +128,15 @@ powershell -ExecutionPolicy Bypass -File tests\windows\run.ps1 -OldVersion 8.2.3
 4. 変更後にヘルスチェック URL が HTTP 500 を返すようにします（例：緩和設定が有効になると失敗するファイル）。php-safepatch がファイルを元に戻すことを確認します。
 5. これらの仮想マシンに対して Ansible プレイブックを実行します。まず `scan`、次に `-e safepatch_mode=apply` の順です。
 
+### Rocky KVM 自動テスト
+
+`sudo bash tests/vm/run-rocky9.sh` は使い捨ての Rocky 9 VM を起動し、Rocky 9.5 の保管
+リポジトリから署名付き PHP 8.2.25 パッケージをインストールします。実際の dnf 更新での
+ブランチ維持、2 つの PHP-FPM サービスの systemd 再起動、HTTP で読んだ緩和値、HTTP 500
+発生時の設定の自動復元を検証します。ログとレポートは `tests/out/vm-rocky9-<timestamp>/`
+に保存します。依存関係と WSL での実行方法は [VM テスト案内](tests/vm/README.ja.md) を参照して
+ください。Remi、yum、Debian サービス統合、パッケージのダウングレードは別途 VM 検証が必要です。
+
 ## リリース前の確認
 
 - `shellcheck -S warning linux/php-safepatch.sh tests/*.sh tests/*/*.sh` の指摘がないこと。

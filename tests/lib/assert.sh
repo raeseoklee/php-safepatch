@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Small assertion helpers shared by the php-safepatch tests. Source this file.
 # SPDX-License-Identifier: MIT
 
