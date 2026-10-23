@@ -23,6 +23,8 @@ The unit suite uses fake PHP binaries, a fake `dpkg-query` and a fake `apt-get`.
 - The branch lock: an upgrade in the same branch runs, but a simulation that installs another branch or removes a package stops the install.
 - Version rules: a branch that is not in the advisory (8.6.0) and a pre-release after the fix (8.5.13-dev) are `UNKNOWN`; a pre-release of the fix (8.5.12RC1) is `VULNERABLE`; a distribution suffix is not a pre-release.
 - A runtime that does not read the mitigation is `not_effective` and the run fails.
+- PHP-FPM pools: a marked block with a wrong value, or a later pool line that sets the value back, is `not_effective`.
+- One PHP-FPM binary with two systemd units (`--fpm-config A`, `-y B -c php.ini`): two runtimes, both pools mitigated, both units restarted, no shifted fields.
 - In auto mode, a patched branch loses all old mitigation, also the PHP-FPM pool blocks.
 - A health URL that changes from 200 to 404 fails the run and restores the files.
 - Advisory files start empty; an invalid file stops the run.
@@ -51,6 +53,8 @@ Each image installs PHP while the security repository is disabled, then restores
 6. A PHP-FPM configuration that is already broken makes `apply` stop with exit code 2 and change nothing.
 
 Each container also starts PHP-FPM with its own configuration file (`-y /etc/php-custom/php-fpm.conf`). The suite checks that php-safepatch uses that file (not the package default), that the status is `RESTART_REQUIRED` after a package upgrade until the master restarts, and that the mitigation is `pending_restart` until the restart and `effective` after it.
+
+A second master runs from the same binary with `-y /etc/php-custom2/php-fpm.conf`. The suite checks that it is a runtime of its own, that it stays `RESTART_REQUIRED` while only the first master is restarted, that its pool is mitigated, and that a pool line that sets the value back makes it `not_effective`.
 
 Some results depend on the repositories on the day of the test:
 
@@ -98,6 +102,8 @@ The Windows suite downloads an old official PHP build (default 8.3.35, NTS, x64)
 - A second `apply` changes nothing.
 - `rollback` restores the old binaries and the original `php.ini`.
 - Function checks without PHP: the assessment, health and argument functions are taken from the script by its syntax tree and tested directly (8.6.0, RC and dev builds, 200 -> 404).
+- Service recovery: when the second Apache service fails to stop, the first one starts again; after an exception in the step, both start again.
+- After a restore, the report reads the version from disk again (8.3.36 -> 8.3.35 is `VULNERABLE`).
 - In auto mode, a patched installation loses its old mitigation; advisory files start empty and are validated.
 
 ```powershell

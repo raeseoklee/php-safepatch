@@ -597,24 +597,44 @@ function Test-HealthAfter($Before) {
 # ---------------------------------------------------------------------------
 function Get-ApacheServices { return @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.PathName -match 'httpd\.exe' -and $_.State -eq 'Running' }) }
 
-function Stop-PhpUsers([string]$Dir, $UsedBy) {
-    $stopped = @()
+# Stops the web servers that use $Dir. Each service goes into $Stopped as soon as it is stopped, so
+# that the caller can start it again even when a later stop fails. Returns $false if files stay in use.
+function Stop-PhpUsers([string]$Dir, $UsedBy, [System.Collections.ArrayList]$Stopped) {
     if ($UsedBy -contains 'iis') {
         Info 'Stopping IIS (iisreset /stop)'
+        [void]$Stopped.Add('iis')    # added first: a partly stopped IIS must also be started again
         & "$env:windir\System32\iisreset.exe" /stop | Out-Null
-        $stopped += 'iis'
     }
     if ($UsedBy -contains 'apache') {
-        foreach ($s in Get-ApacheServices) { Info "Stopping service $($s.Name)"; Stop-Service -Name $s.Name -Force; $stopped += "svc:$($s.Name)" }
+        foreach ($s in Get-ApacheServices) {
+            Info "Stopping service $($s.Name)"
+            Stop-Service -Name $s.Name -Force -ErrorAction Stop
+            [void]$Stopped.Add("svc:$($s.Name)")
+        }
     }
     Start-Sleep -Seconds 2
-    $left = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -and $_.Path -like "$Dir\*" } catch { $false } })
+    $left = @(Get-DirProcesses $Dir)
     if ($left.Count -gt 0) {
         Err ("Processes still use {0}: {1}. Stop them and run apply again." -f $Dir, (($left | ForEach-Object { "$($_.Name)($($_.Id))" }) -join ', '))
-        Start-PhpUsers $stopped
-        return $null
+        return $false
     }
-    return , $stopped
+    return $true
+}
+
+# Runs $Body while the web servers that use $Dir are stopped. Whatever happens (a failed stop, a
+# failed step, an exception), every service that was stopped is started again. Returns $Body's result,
+# or $false when the services could not be stopped.
+function Invoke-WithStoppedUsers([string]$Dir, $UsedBy, [scriptblock]$Body) {
+    $stopped = New-Object System.Collections.ArrayList
+    try {
+        if (-not (Stop-PhpUsers $Dir $UsedBy $stopped)) { return $false }
+        return (& $Body)
+    } catch {
+        Err "Step with stopped services failed for ${Dir}: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Start-PhpUsers $stopped
+    }
 }
 
 function Start-PhpUsers($Stopped) {
@@ -689,32 +709,31 @@ function Update-PhpDir($rt) {
     Expand-Archive -LiteralPath $zipPath -DestinationPath $ext -Force
     if (-not (Test-Path -LiteralPath (Join-Path $ext 'php.exe'))) { Err "Zip $($z.File) has no php.exe"; return $false }
 
-    $stopped = Stop-PhpUsers $rt.path $rt.used_by
-    if ($null -eq $stopped) { return $false }
-    # From here the web services are stopped. "finally" starts them again in every case,
-    # also when an exception occurs; a partial copy is restored from the backup first.
+    # Everything from the first stopped service to the last copied file is one recoverable step:
+    # Invoke-WithStoppedUsers starts the services again in every case, and the inner "finally"
+    # restores a partial copy from the backup first.
     $bk = Join-Path $Script:RunDir ('backup\dir_' + (Get-ShortHash $rt.path))
-    $copyStarted = $false; $ok = $false
-    try {
-        Info "Backing up $($rt.path) to $bk"
-        & robocopy.exe $rt.path $bk /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-        if ($LASTEXITCODE -ge 8) { Err "Backup failed (robocopy $LASTEXITCODE)"; return $false }
-        Add-Manifest "DIR`t$($rt.path)`t$bk"
-        # Copy the new files over the old ones. php.ini, third-party extensions and other local files stay.
-        $copyStarted = $true
-        & robocopy.exe $ext $rt.path /E /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-        if ($LASTEXITCODE -ge 8) { Err "Copy failed (robocopy $LASTEXITCODE). Restoring $($rt.path)."; return $false }
-        $ok = $true
-    } catch {
-        Err "Update of $($rt.path) failed: $($_.Exception.Message). Restoring."
-        return $false
-    } finally {
-        if (-not $ok -and $copyStarted) {
-            & robocopy.exe $bk $rt.path /MIR /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-            if ($LASTEXITCODE -ge 8) { Err "Restore of $($rt.path) failed (robocopy $LASTEXITCODE). Restore it from $bk manually." }
+    $ok = Invoke-WithStoppedUsers $rt.path $rt.used_by {
+        $copyStarted = $false; $done = $false
+        try {
+            Info "Backing up $($rt.path) to $bk"
+            & robocopy.exe $rt.path $bk /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { Err "Backup failed (robocopy $LASTEXITCODE)"; return $false }
+            Add-Manifest "DIR`t$($rt.path)`t$bk"
+            # Copy the new files over the old ones. php.ini, third-party extensions and other local files stay.
+            $copyStarted = $true
+            & robocopy.exe $ext $rt.path /E /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { Err "Copy failed (robocopy $LASTEXITCODE). Restoring $($rt.path)."; return $false }
+            $done = $true
+            return $true
+        } finally {
+            if (-not $done -and $copyStarted) {
+                & robocopy.exe $bk $rt.path /MIR /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+                if ($LASTEXITCODE -ge 8) { Err "Restore of $($rt.path) failed (robocopy $LASTEXITCODE). Restore it from $bk manually." }
+            }
         }
-        Start-PhpUsers $stopped
     }
+    if (-not $ok) { return $false }
     [void]$Script:Changes.Add("binaries:$($rt.path) $($rt.version) -> $($z.Version) ($($rt.build))")
     return $true
 }
@@ -791,12 +810,14 @@ function Restore-Run([string]$Rd) {
             'FILE' { Copy-Item -LiteralPath (Join-Path $Rd ('backup\' + $p[2])) -Destination $p[1] -Force; Info "Restored $($p[1])" }
             'CREATED' { if (Test-Path -LiteralPath $p[1]) { Remove-Item -LiteralPath $p[1] -Force; Info "Removed $($p[1])" } }
             'DIR' {
-                $users = @(Get-DirUsers $p[1])
-                $stopped = Stop-PhpUsers $p[1] $users
-                if ($null -eq $stopped) { Err "Cannot restore $($p[1]) while processes use it"; continue }
-                & robocopy.exe $p[2] $p[1] /MIR /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-                if ($LASTEXITCODE -ge 8) { Err "Restore of $($p[1]) failed (robocopy $LASTEXITCODE)" } else { Info "Restored directory $($p[1])" }
-                Start-PhpUsers $stopped
+                $target = $p[1]; $source = $p[2]
+                $ok = Invoke-WithStoppedUsers $target @(Get-DirUsers $target) {
+                    & robocopy.exe $source $target /MIR /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+                    if ($LASTEXITCODE -ge 8) { Err "Restore of $target failed (robocopy $LASTEXITCODE)"; return $false }
+                    Info "Restored directory $target"
+                    return $true
+                }
+                if (-not $ok) { Err "Directory $target was not restored. Restore it from $source manually." }
             }
         }
     }
@@ -812,6 +833,10 @@ function Invoke-Scan {
 }
 
 function Update-State($rt) {
+    # Read the version from disk again: a restore or a rollback can have put the old binaries back.
+    $info = Get-PhpInfo $rt.path
+    if ($info.Version) { $rt.version = $info.Version; $rt.branch = (Get-Branch $info.Version) }
+    if ($info.Build) { $rt.build = $info.Build }
     Set-Running $rt
     Set-Assessment $rt
     Set-MitigationState $rt

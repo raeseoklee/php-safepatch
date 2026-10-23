@@ -630,7 +630,7 @@ print_report() {
   printf '%-18s %-15s %-11s %-8s %-16s %-40s %s\n' "STATUS" "SAPI" "VERSION" "RUNNING" "MITIGATION" "RUNTIME" "PACKAGE"
   for i in "${!RT_PATH[@]}"; do
     printf '%-18s %-15s %-11s %-8s %-16s %-40s %s\n' "${RT_STATUS[i]}" "${RT_SAPI[i]}" "${RT_VERSION[i]:--}" \
-      "${RT_RUNNING[i]}" "${RT_MITIG[i]}" "${RT_PATH[i]}" \
+      "${RT_RUNNING[i]}" "${RT_MITIG[i]}" "${RT_PATH[i]}${RT_FPMCONF[i]:+ (-y ${RT_FPMCONF[i]})}" \
       "${RT_PKG[i]:+${RT_PKG[i]} ${RT_PKGVER[i]}}${RT_IMAGE[i]:+image ${RT_IMAGE[i]}}"
     is_bad_status "${RT_STATUS[i]}" && printf '%-18s -> %s. %s\n' "" "${RT_REASON[i]}" "${RT_ACTION[i]}"
   done
@@ -982,6 +982,8 @@ fpm_default_conf() {  # fpm_default_conf BIN -> php-fpm.conf that the binary use
 # Running processes: which runtimes run, and which run a binary that was replaced on disk
 # ---------------------------------------------------------------------------
 declare -A RUN_STATE=() RUN_START=()
+# PHP-FPM masters, by the configuration file in their process title: state and start time.
+declare -A FPM_MASTER_STATE=() FPM_MASTER_START=() FPM_MASTER_BIN=()
 note_proc() {  # note_proc PATH START_EPOCH
   local p="$1" st="$2" state=yes
   case "$p" in *" (deleted)") p="${p% (deleted)}"; state=stale ;; esac
@@ -990,12 +992,20 @@ note_proc() {  # note_proc PATH START_EPOCH
 }
 
 scan_processes() {
-  RUN_STATE=(); RUN_START=()
-  local pid exe st m
+  RUN_STATE=(); RUN_START=(); FPM_MASTER_STATE=(); FPM_MASTER_START=(); FPM_MASTER_BIN=()
+  local pid exe st m t c
   for pid in /proc/[0-9]*; do
     exe="$(readlink -- "$pid/exe" 2>/dev/null)" || continue
     st="$(stat -c %Y "$pid" 2>/dev/null)"     # start time of the process
     note_proc "$exe" "$st"
+    if is_php_name "$(basename -- "${exe% (deleted)}")"; then
+      t="$(tr '\0' ' ' <"$pid/cmdline" 2>/dev/null)"
+      if [[ "$t" =~ master\ process\ \(([^\)]+)\) ]]; then
+        c="${BASH_REMATCH[1]}"
+        case "$exe" in *" (deleted)") FPM_MASTER_STATE[$c]=stale ;; *) [ "${FPM_MASTER_STATE[$c]:-}" = stale ] || FPM_MASTER_STATE[$c]=yes ;; esac
+        FPM_MASTER_START[$c]="$st"; FPM_MASTER_BIN[$c]="${exe% (deleted)}"
+      fi
+    fi
     case "$(basename -- "${exe% (deleted)}")" in
       apache2|httpd|httpd.worker|httpd.event)  # mod_php is a library inside the web server
         while IFS= read -r m; do note_proc "$m" "$st"; done \
@@ -1007,42 +1017,77 @@ scan_processes() {
 set_running() {  # set_running INDEX -- yes, no, stale (old code still runs) or unknown (containers)
   local i="$1"
   if [ -n "${RT_CONTAINER[i]}" ]; then RT_RUNNING[i]="unknown"; return; fi
+  # A PHP-FPM runtime is one binary with one configuration: use the master of that configuration.
+  if [ "${RT_SAPI[i]}" = "fpm-fcgi" ] && [ -n "${RT_FPMCONF[i]}" ] && [ "${#FPM_MASTER_STATE[@]}" -gt 0 ]; then
+    RT_RUNNING[i]="${FPM_MASTER_STATE[${RT_FPMCONF[i]}]:-no}"
+    return
+  fi
   RT_RUNNING[i]="${RUN_STATE[${RT_PATH[i]}]:-no}"
+}
+
+proc_start_of() {  # proc_start_of INDEX -> start time of the oldest process of this runtime
+  local i="$1"
+  if [ "${RT_SAPI[i]}" = "fpm-fcgi" ] && [ -n "${FPM_MASTER_START[${RT_FPMCONF[i]:-}]:-}" ]; then
+    printf '%s' "${FPM_MASTER_START[${RT_FPMCONF[i]}]}"
+  else
+    printf '%s' "${RUN_START[${RT_PATH[i]}]:-}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
 # Service configuration: the files that the running service really reads
 # ---------------------------------------------------------------------------
 RT_UNIT=()
-service_config() {  # service_config INDEX -- fills RT_FPMCONF, RT_INI, RT_SCANENV, RT_UNIT
-  local i="$1" bin="${RT_PATH[$1]}" pid exe t u ex argv envs
+systemd_present() { [ -d /run/systemd/system ] || [ "${PHP_SAFEPATCH_TEST_SYSTEMD:-0}" = 1 ]; }
+
+# fpm_service_configs BIN -> one "conf|php.ini|scan dir|unit" line per configuration that
+# runs this PHP-FPM binary: every systemd unit and every running master. One binary can serve
+# several services with different -y files; each of them is a runtime of its own.
+fpm_service_configs() {
+  local bin="$1" u ex argv envs conf ini scan def c
   local re_y='(^| )(-y|--fpm-config)[= ]([^ ]+)' re_c='(^| )(-c|--php-ini)[= ]([^ ]+)' re_s='(^| )PHP_INI_SCAN_DIR=([^ ]+)'
-  RT_UNIT[i]=""
-  [ -z "${RT_CONTAINER[i]}" ] || return 0
-  [ "${RT_SAPI[i]}" = "fpm-fcgi" ] || return 0
-  # 1. A running master shows its configuration file in its process title.
-  for pid in /proc/[0-9]*; do
-    exe="$(readlink -- "$pid/exe" 2>/dev/null)" || continue
-    [ "${exe% (deleted)}" = "$bin" ] || continue
-    t="$(tr '\0' ' ' <"$pid/cmdline" 2>/dev/null)"
-    if [[ "$t" =~ master\ process\ \(([^\)]+)\) ]]; then RT_FPMCONF[i]="${BASH_REMATCH[1]}"; break; fi
-  done
-  # 2. The systemd unit gives -y, -c and PHP_INI_SCAN_DIR.
-  if have systemctl && [ -d /run/systemd/system ]; then
+  declare -A seen=()
+  def="$(fpm_default_conf "$bin")"
+  if have systemctl && systemd_present; then
     while read -r u; do
+      [ -n "$u" ] || continue
       ex="$(systemctl show -p ExecStart --value "$u" 2>/dev/null)"
       [[ "$ex" == *"$bin"* ]] || continue
       argv="${ex#*argv[]=}"; argv="${argv%% ;*}"
-      [ -z "${RT_FPMCONF[i]}" ] && [[ "$argv" =~ $re_y ]] && RT_FPMCONF[i]="${BASH_REMATCH[3]}"
-      [[ "$argv" =~ $re_c ]] && RT_INI[i]="${BASH_REMATCH[3]}"
+      conf="$def"; ini=""; scan=""
+      [[ "$argv" =~ $re_y ]] && conf="${BASH_REMATCH[3]}"
+      [[ "$argv" =~ $re_c ]] && ini="${BASH_REMATCH[3]}"
       envs="$(systemctl show -p Environment --value "$u" 2>/dev/null)"
-      [[ "$envs" =~ $re_s ]] && RT_SCANENV[i]="${BASH_REMATCH[2]}"
-      RT_UNIT[i]="$u"
-      break
+      [[ "$envs" =~ $re_s ]] && scan="${BASH_REMATCH[2]}"
+      [ -n "${seen[$conf]:-}" ] && continue
+      seen[$conf]=1
+      printf '%s|%s|%s|%s\n' "$conf" "$ini" "$scan" "$u"
     done < <(systemctl list-units --type=service --all --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -Ei 'php|fpm')
   fi
-  # 3. Default of the binary.
-  [ -n "${RT_FPMCONF[i]}" ] || RT_FPMCONF[i]="$(fpm_default_conf "$bin")"
+  for c in "${!FPM_MASTER_BIN[@]}"; do          # masters started by hand or by other init systems
+    [ "${FPM_MASTER_BIN[$c]}" = "$bin" ] || continue
+    [ -n "${seen[$c]:-}" ] && continue
+    seen[$c]=1
+    printf '%s|||\n' "$c"
+  done
+  [ "${#seen[@]}" -gt 0 ] || printf '%s|||\n' "$def"
+}
+
+service_config() {  # service_config INDEX -- fills RT_FPMCONF, RT_INI, RT_SCANENV, RT_UNIT; adds a runtime per extra configuration
+  local i="$1" first=1 conf ini scan unit j
+  RT_UNIT[i]=""
+  [ -z "${RT_CONTAINER[i]}" ] || return 0
+  [ "${RT_SAPI[i]}" = "fpm-fcgi" ] || return 0
+  # "|" and not a tab: read joins consecutive whitespace separators, so empty fields would shift.
+  while IFS='|' read -r conf ini scan unit; do
+    if [ "$first" -eq 1 ]; then
+      j="$i"; first=0
+    else
+      add_runtime "${RT_PATH[i]}" "${RT_SAPI[i]}" "${RT_VERSION[i]}" "${RT_PKGMGR[i]}" "${RT_PKG[i]}" "${RT_PKGVER[i]}" 0 "" ""
+      j=$((${#RT_PATH[@]} - 1))
+    fi
+    RT_FPMCONF[j]="$conf"; RT_INI[j]="$ini"; RT_SCANENV[j]="$scan"; RT_UNIT[j]="$unit"
+  done < <(fpm_service_configs "${RT_PATH[i]}")
   return 0
 }
 
@@ -1060,7 +1105,7 @@ apache_mitigation_conf() {  # path of the Apache mitigation file for this OS (ma
 }
 
 mitigation_state() {  # mitigation_state INDEX -> RT_MITIG: none, effective, pending_restart, not_effective
-  local i="$1" b="${RT_BRANCH[$1]}" files=() f d k v got info newest=0 m bad=0 pools=0 blocked=0
+  local i="$1" b="${RT_BRANCH[$1]}" files=() f d k v info newest=0 m bad=0 pools=0 blocked=0
   if [ -n "${RT_CONTAINER[i]}" ] || [ -z "$b" ]; then RT_MITIG[i]="unknown"; return; fi
   local rules; rules="$(mitigation_rules "$b")"
   case "${RT_SAPI[i]}" in
@@ -1080,20 +1125,36 @@ mitigation_state() {  # mitigation_state INDEX -> RT_MITIG: none, effective, pen
   # Check the values that the runtime really reads (same -c and PHP_INI_SCAN_DIR as its service).
   if [ "${RT_SAPI[i]}" != "apache2handler" ]; then
     info="$(php_info "$i")"
+    declare -A want=() ini=()
     while read -r k v; do
       [ -n "$k" ] || continue
-      got="$(awk -F' => ' -v k="$k" '$1 == k {print $2; exit}' <<<"$info")"
-      [ "$(norm_ini "$got")" = "$(norm_ini "$v")" ] || bad=1
+      want[$k]="$v"
+      ini[$k]="$(awk -F' => ' -v k="$k" '$1 == k {print $2; exit}' <<<"$info")"
     done <<<"$rules"
-    # PHP-FPM pools with an admin-locked block enforce the values even when conf.d is not read.
-    [ "$bad" -eq 1 ] && [ "$pools" -gt 0 ] && [ "$blocked" -eq "$pools" ] && bad=0
+    if [ "$pools" -gt 0 ]; then
+      # PHP-FPM: every pool must end with the advisory value. A pool value overrides conf.d;
+      # a marker alone proves nothing (the block can hold a wrong value or be overridden).
+      local pool key val
+      while IFS=$'\t' read -r pool key val; do
+        [ -n "$pool" ] || continue
+        [ -n "$val" ] || val="${ini[$key]}"
+        if [ "$(norm_ini "$val")" != "$(norm_ini "${want[$key]}")" ]; then
+          bad=1; _log_line "WARN pool [$pool] of ${RT_FPMCONF[i]}: $key = '$val', expected '${want[$key]}'"
+        fi
+      done < <(fpm_pool_values "${RT_FPMCONF[i]}" "${!want[@]}")
+    else
+      for k in "${!want[@]}"; do
+        [ "$(norm_ini "${ini[$k]}")" = "$(norm_ini "${want[$k]}")" ] || bad=1
+      done
+    fi
   fi
   if [ "$bad" -eq 1 ]; then RT_MITIG[i]="not_effective"; return; fi
   for f in "${files[@]}"; do
     m="$(stat -c %Y "$f" 2>/dev/null || echo 0)"; [ "$m" -gt "$newest" ] && newest="$m"
   done
   # Processes that started before the newest change still use the old configuration.
-  if [ "${RT_RUNNING[i]}" != "no" ] && [ -n "${RUN_START[${RT_PATH[i]}]:-}" ] && [ "${RUN_START[${RT_PATH[i]}]}" -lt "$newest" ]; then
+  local started; started="$(proc_start_of "$i")"
+  if [ "${RT_RUNNING[i]}" != "no" ] && [ -n "$started" ] && [ "$started" -lt "$newest" ]; then
     RT_MITIG[i]="pending_restart"
   else
     RT_MITIG[i]="effective"
@@ -1111,6 +1172,35 @@ fpm_pool_files() {  # fpm_pool_files MAIN_CONF
     case "$inc" in /*) ;; *) inc="$dir/${inc#./}" ;; esac
     for f in $inc; do [ -f "$f" ] && printf '%s\n' "$f"; done
   done < <(sed -n 's/^[[:space:]]*include[[:space:]]*=[[:space:]]*//p' "$conf")
+}
+
+# fpm_pool_values CONF KEY... -> "pool<TAB>key<TAB>value" for every pool and key. The value is the one
+# that PHP-FPM applies: the last php_admin_value/php_admin_flag, else the last php_value/php_flag,
+# else empty (the pool does not set the key, so conf.d and php.ini apply).
+fpm_pool_values() {
+  local conf="$1"; shift
+  local files=()
+  mapfile -t files < <(fpm_pool_files "$conf" | sort -u)
+  [ "${#files[@]}" -gt 0 ] || return 0
+  awk -v keys="$*" '
+    BEGIN { n = split(keys, K, " "); for (j = 1; j <= n; j++) want[K[j]] = 1 }
+    /^[ \t]*\[[^]]+\][ \t]*$/ { s = $0; gsub(/[][ \t]/, "", s); pool = (s == "global") ? "" : s; if (pool != "") pools[pool] = 1; next }
+    pool != "" && /^[ \t]*php_(admin_)?(value|flag)\[/ {
+      line = $0; sub(/^[ \t]*/, "", line)
+      admin = (line ~ /^php_admin_/)
+      key = line; sub(/^[^[]*\[/, "", key); sub(/\].*$/, "", key)
+      if (!(key in want)) next
+      val = line; sub(/^[^=]*=[ \t]*/, "", val); sub(/[ \t]*;.*$/, "", val); sub(/[ \t]+$/, "", val); gsub(/"/, "", val)
+      if (admin) A[pool SUBSEP key] = val
+      else P[pool SUBSEP key] = val
+    }
+    END {
+      for (p in pools) for (k in want) {
+        v = ""
+        if ((p SUBSEP k) in A) v = A[p SUBSEP k]; else if ((p SUBSEP k) in P) v = P[p SUBSEP k]
+        print p "\t" k "\t" v
+      }
+    }' "${files[@]}"
 }
 
 patch_pool_file() {  # patch_pool_file FILE BRANCH [remove] -- adds (or removes) the block in every non-global section
@@ -1255,7 +1345,7 @@ restart_services() {  # restart_services "BRANCHES" -- restarts PHP and web serv
     ACTIONS_DONE+=("restart:skipped")
     return 0
   fi
-  if have systemctl && [ -d /run/systemd/system ]; then
+  if have systemctl && systemd_present; then
     mapfile -t units < <(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' \
       | grep -E '^(php[0-9.]*-fpm|php-fpm|php[0-9]+-php-fpm|rh-php[0-9]+-php-fpm|ea-php[0-9]+-php-fpm|plesk-php[0-9]+-fpm|apache2|httpd|lsws|lshttpd)\.service$')
     # Units found from the runtimes themselves (custom unit names) are restarted too.
@@ -1299,7 +1389,8 @@ do_scan() {
   local i
   for i in "${!RT_SAPI[@]}"; do [ "${RT_SAPI[i]}" = "apache2handler" ] && HAS_MOD_PHP=1; done
   scan_processes
-  for i in "${!RT_PATH[@]}"; do set_running "$i"; service_config "$i"; done
+  for i in "${!RT_PATH[@]}"; do service_config "$i"; done   # can add runtimes (one per FPM configuration)
+  for i in "${!RT_PATH[@]}"; do set_running "$i"; done
   assess_all
   for i in "${!RT_PATH[@]}"; do mitigation_state "$i"; done
   scan_dockerfiles
@@ -1311,6 +1402,16 @@ refresh_state() {  # reads processes, versions and mitigation state again (after
   scan_processes
   for i in "${!RT_PATH[@]}"; do
     [ -z "${RT_CONTAINER[i]}" ] || continue
+    # Read the version from disk again: a restore or rollback can have put the old one back.
+    if [ "${RT_SAPI[i]}" = "apache2handler" ]; then
+      if [ -n "${RT_PKG[i]}" ]; then
+        RT_PKGVER[i]="$(pkg_version "${RT_PKG[i]}")"
+        [[ "${RT_PKGVER[i]}" =~ ^([0-9]+:)?([0-9]+\.[0-9]+\.[0-9]+) ]] && RT_VERSION[i]="${BASH_REMATCH[2]}"
+      fi
+    else
+      RT_VERSION[i]="$(parse_php_version "$(php_version_line "${RT_PATH[i]}")")"
+      [ -n "${RT_PKG[i]}" ] && RT_PKGVER[i]="$(pkg_version "${RT_PKG[i]}")"
+    fi
     set_running "$i"
     assess_one "$i"
     mitigation_state "$i"

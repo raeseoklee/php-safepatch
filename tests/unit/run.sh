@@ -39,9 +39,11 @@ for a in "\$@"; do
         fi
         for k in "\${!v[@]}"; do echo "\$k => \${v[\$k]} => \${v[\$k]}"; done
         exit 0 ;;
-    -t) if grep -q 'not-a-valid-mode' "$T"/fpm/pool.d/*.conf; then echo "ERROR: bad pm"; exit 78; fi
-        if [ -e "$T/fail-after-change" ] && grep -q php-safepatch "$T"/fpm/pool.d/*.conf; then echo "ERROR: rejected"; exit 78; fi
-        echo "NOTICE: configuration file $T/fpm/php-fpm.conf test is successful"; exit 0 ;;
+    -t) y=""; prev=""; for b in "\$@"; do [ "\$prev" = -y ] && y="\$b"; prev="\$b"; done
+        conf="\${y:-$T/fpm/php-fpm.conf}"; pdir="\$(dirname "\$conf")/pool.d"
+        if grep -q 'not-a-valid-mode' "\$pdir"/*.conf; then echo "ERROR: bad pm"; exit 78; fi
+        if [ -e "$T/fail-after-change" ] && grep -q php-safepatch "\$pdir"/*.conf; then echo "ERROR: rejected"; exit 78; fi
+        echo "NOTICE: configuration file \$conf test is successful"; exit 0 ;;
   esac
 done
 EOF
@@ -135,6 +137,56 @@ bash "$S" apply --no-docker --no-ioc --no-restart --no-patch --state-dir "$T/sta
 check_eq "apply exit code is 2" 2 "$?"
 check_eq "mitigation=not_effective" not_effective "$(rt_field "$T/deaf.json" /deaf/php8.1 mitigation)"
 check "error says the runtime does not use the mitigation" grep -q 'does not use it' "$T/deaf.out"
+
+section "PHP-FPM: the final value of each pool counts, not the marker"
+setup
+printf 'session.upload_progress.enabled = 0\n' >"$INI"
+# A marked block with a wrong value in every pool.
+awk '/^\[api\]/ { print "; >>> php-safepatch PHP2Shell mitigation >>>\nphp_admin_value[session.upload_progress.enabled] = 1\n; <<< php-safepatch PHP2Shell mitigation <<<" } { print } END { print "; >>> php-safepatch PHP2Shell mitigation >>>\nphp_admin_value[session.upload_progress.enabled] = 1\n; <<< php-safepatch PHP2Shell mitigation <<<" }' \
+  "$T/fpm/pool.d/www.conf" >"$T/www.tmp" && mv "$T/www.tmp" "$T/fpm/pool.d/www.conf"
+bash "$S" scan --no-docker --no-ioc --quiet --state-dir "$T/state" --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/wrong.json" >/dev/null 2>&1
+check_eq "marked block with value 1 is not_effective" not_effective "$(rt_field "$T/wrong.json" /php-fpm8.4 mitigation)"
+setup
+bash "$S" apply --no-docker --no-ioc --no-restart --no-patch --state-dir "$T/state" --yes --quiet --advisory "$ADV" \
+  --php "$T/bin/php-fpm8.4" --json "$T/good.json" >/dev/null 2>&1
+check_eq "correct blocks: effective" effective "$(rt_field "$T/good.json" /php-fpm8.4 mitigation)"
+printf 'php_admin_flag[session.upload_progress.enabled] = on\n' >>"$T/fpm/pool.d/www.conf"   # later line in [api]
+bash "$S" scan --no-docker --no-ioc --quiet --state-dir "$T/state" --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/over.json" >/dev/null 2>&1
+check_eq "a later admin line that sets the value back is not_effective" not_effective "$(rt_field "$T/over.json" /php-fpm8.4 mitigation)"
+
+section "One PHP-FPM binary with two services (-y A and -y B): two runtimes"
+setup
+for x in A B; do
+  mkdir -p "$T/fpm$x/pool.d"
+  printf '[global]\ninclude=%s/fpm%s/pool.d/*.conf\n' "$T" "$x" >"$T/fpm$x/php-fpm.conf"
+  printf '[site%s]\nuser = www-data\n' "$x" >"$T/fpm$x/pool.d/site.conf"
+done
+cat >"$T/fakebin/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "systemctl \$*" >>"$T/systemctl.calls"
+case "\$*" in
+  *list-units*) printf 'php-site-a.service loaded active running A\nphp-site-b.service loaded active running B\n' ;;
+  *ExecStart*php-site-a*) echo "{ path=$T/bin/php-fpm8.4 ; argv[]=$T/bin/php-fpm8.4 --nodaemonize --fpm-config $T/fpmA/php-fpm.conf ; }" ;;
+  *ExecStart*php-site-b*) echo "{ path=$T/bin/php-fpm8.4 ; argv[]=$T/bin/php-fpm8.4 --nodaemonize -y $T/fpmB/php-fpm.conf -c $T/fpmB/php.ini ; }" ;;
+  *Environment*) echo "" ;;
+esac
+exit 0
+EOF
+chmod +x "$T/fakebin/systemctl"
+PATH="$T/fakebin:$PATH" PHP_SAFEPATCH_TEST_SYSTEMD=1 bash "$S" scan --no-docker --no-ioc --quiet --state-dir "$T/state" \
+  --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/multi.json" >/dev/null 2>&1
+check_eq "two PHP-FPM runtimes for one binary" 2 "$(grep -o '"sapi":"fpm-fcgi"' "$T/multi.json" | wc -l | tr -d ' ')"
+check "runtime with config A" grep -q "\"fpm_conf\":\"$T/fpmA/php-fpm.conf\"" "$T/multi.json"
+check "runtime with config B" grep -q "\"fpm_conf\":\"$T/fpmB/php-fpm.conf\"" "$T/multi.json"
+check "unit A is recorded (no -c: fields do not shift)" grep -q "\"php_ini\":\"\",\"scan_dir_env\":\"\",\"unit\":\"php-site-a.service\"" "$T/multi.json"
+check "unit B keeps its -c php.ini" grep -q "\"php_ini\":\"$T/fpmB/php.ini\",\"scan_dir_env\":\"\",\"unit\":\"php-site-b.service\"" "$T/multi.json"
+rm -f "$T/systemctl.calls"
+PATH="$T/fakebin:$PATH" PHP_SAFEPATCH_TEST_SYSTEMD=1 bash "$S" apply --no-docker --no-ioc --no-patch --state-dir "$T/state" --yes --quiet \
+  --advisory "$ADV" --php "$T/bin/php-fpm8.4" --json "$T/multi2.json" >/dev/null 2>&1
+check "pool of service A carries the block" grep -q 'php_admin_value\[session.upload_progress.enabled\] = 0' "$T/fpmA/pool.d/site.conf"
+check "pool of service B carries the block" grep -q 'php_admin_value\[session.upload_progress.enabled\] = 0' "$T/fpmB/pool.d/site.conf"
+check "unit A is restarted" grep -q 'restart php-site-a.service' "$T/systemctl.calls"
+check "unit B is restarted" grep -q 'restart php-site-b.service' "$T/systemctl.calls"
 
 section "Patched branch: old mitigation is removed everywhere (ini and PHP-FPM pools)"
 setup

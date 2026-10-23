@@ -58,7 +58,32 @@ $script:codes = @(404); function Get-HttpCode($u) { $c = $script:codes[0]; if ($
 Check 'health 200 -> 404 fails' (-not (Test-HealthAfter @{ 'http://app.test/health' = 200 }))
 $script:codes = @(200)
 Check 'health 200 -> 200 passes' (Test-HealthAfter @{ 'http://app.test/health' = 200 })
-Remove-Item Function:\Start-Sleep, Function:\Info, Function:\Warn, Function:\Err
+# Service recovery: the second Apache service fails to stop. The first one must start again.
+foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($fn.Name -in 'Stop-PhpUsers', 'Start-PhpUsers', 'Invoke-WithStoppedUsers', 'Update-State') { . ([scriptblock]::Create($fn.Extent.Text)) }
+}
+$script:started = @()
+function Get-ApacheServices { return @([pscustomobject]@{ Name = 'ApacheA' }, [pscustomobject]@{ Name = 'ApacheB' }) }
+function Get-DirProcesses($d) { return @() }
+function Stop-Service { param($Name, [switch]$Force, $ErrorAction) if ($Name -eq 'ApacheB') { throw 'access denied' } }
+function Start-Service { param($Name, $ErrorAction) $script:started += $Name }
+$r = Invoke-WithStoppedUsers 'C:\php' @('apache') { return $true }
+Check 'a failed stop of ApacheB returns $false' ($r -eq $false)
+Check 'ApacheA, already stopped, is started again' ($script:started -contains 'ApacheA')
+$script:started = @()
+function Stop-Service { param($Name, [switch]$Force, $ErrorAction) }
+$r = Invoke-WithStoppedUsers 'C:\php' @('apache') { throw 'copy failed' }
+Check 'an exception in the body returns $false' ($r -eq $false)
+Check 'both services are started again after the exception' (($script:started -contains 'ApacheA') -and ($script:started -contains 'ApacheB'))
+# After a restore, the report must show the version on disk, not the version before the restore.
+function Get-PhpInfo($d) { return @{ Version = '8.3.35'; Build = 'nts-vs16-x64' } }
+function Set-Running($rt) { }
+function Set-MitigationState($rt) { }
+$rt = @{ path = 'C:\php'; version = '8.3.36'; branch = '8.3'; build = 'nts-vs16-x64'; status = 'PATCHED'; installed = 'PATCHED'; reason = ''; action = '' }
+Update-State $rt
+Check 'Update-State reads the version again (8.3.36 -> 8.3.35 after a restore)' ($rt.version -eq '8.3.35' -and $rt.status -eq 'VULNERABLE')
+Remove-Item Function:\Start-Sleep, Function:\Info, Function:\Warn, Function:\Err, Function:\Stop-Service, Function:\Start-Service, `
+    Function:\Get-ApacheServices, Function:\Get-DirProcesses, Function:\Get-PhpInfo, Function:\Set-Running, Function:\Set-MitigationState
 $Adv = Join-Path $Repo 'advisories\php2shell.conf'
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12

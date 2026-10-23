@@ -54,16 +54,27 @@ POOL_DIR="$CUSTOM/pool.d"
 fpm_start() { "$FPM" -y "$CUSTOM/php-fpm.conf" && sleep 1 && [ -s /run/php-custom-fpm.pid ]; }
 fpm_stop() { [ -s /run/php-custom-fpm.pid ] && kill "$(cat /run/php-custom-fpm.pid)" 2>/dev/null; sleep 2; }
 fpm_restart() { fpm_stop; fpm_start; }
+# A second master from the same binary with another configuration: a runtime of its own.
+CUSTOM2=/etc/php-custom2
+fpm2_start() { "$FPM" -y "$CUSTOM2/php-fpm.conf" && sleep 1 && [ -s /run/php-custom2-fpm.pid ]; }
+fpm2_stop() { [ -s /run/php-custom2-fpm.pid ] && kill "$(cat /run/php-custom2-fpm.pid)" 2>/dev/null; sleep 2; }
+fpm2_restart() { fpm2_stop; fpm2_start; }
+conf_field() {  # conf_field JSON FPM_CONF FIELD -- a field of the PHP-FPM runtime that uses FPM_CONF
+  grep -o "{\"path\":\"[^\"]*\",\"sapi\":\"fpm-fcgi\"[^}]*\"fpm_conf\":\"$2\"" "$1" | grep -o "\"$3\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+}
 if [ -n "$FPM" ]; then
-  mkdir -p "$POOL_DIR"
+  mkdir -p "$POOL_DIR" "$CUSTOM2/pool.d"
   printf '[global]\npid = /run/php-custom-fpm.pid\nerror_log = /tmp/php-custom-fpm.log\ndaemonize = yes\ninclude = %s/*.conf\n' "$POOL_DIR" >"$CUSTOM/php-fpm.conf"
   printf '[custom]\nuser = daemon\nlisten = 127.0.0.1:9901\npm = static\npm.max_children = 1\n' >"$POOL_DIR/custom.conf"
+  printf '[global]\npid = /run/php-custom2-fpm.pid\nerror_log = /tmp/php-custom2-fpm.log\ndaemonize = yes\ninclude = %s/pool.d/*.conf\n' "$CUSTOM2" >"$CUSTOM2/php-fpm.conf"
+  printf '[second]\nuser = daemon\nlisten = 127.0.0.1:9902\npm = static\npm.max_children = 1\n' >"$CUSTOM2/pool.d/second.conf"
 fi
 
 printf 'php-safepatch container test: family=%s branch=%s fpm=%s mod_php=%s\n' "$FAMILY" "$BRANCH" "${FPM:-none}" "$HAS_MOD_PHP"
 php -v | head -1
 pkgs >"$W/pkgs.0"; modules >"$W/mods.0"; VER0="$(php -r 'echo PHP_VERSION;')"
 [ -n "$FPM" ] && { fpm_start && pass "PHP-FPM runs with -y $CUSTOM/php-fpm.conf" || fail "PHP-FPM with -y $CUSTOM/php-fpm.conf does not start"; }
+[ -n "$FPM" ] && { fpm2_start && pass "second PHP-FPM (same binary) runs with -y $CUSTOM2/php-fpm.conf" || fail "second PHP-FPM does not start"; }
 
 # ---------------------------------------------------------------------------
 section "1. scan makes no change and finds the real service configuration"
@@ -79,6 +90,7 @@ fi
 if [ -n "$FPM" ]; then
   check_eq "PHP-FPM is running" yes "$(fpm_field "$W/scan.json" running)"
   check_eq "PHP-FPM config is the one of the running master (-y)" "$CUSTOM/php-fpm.conf" "$(fpm_field "$W/scan.json" fpm_conf)"
+  check_eq "the second master is a runtime of its own" yes "$(conf_field "$W/scan.json" "$CUSTOM2/php-fpm.conf" running)"
 fi
 STATUS0="$(grep -o '"status":"[A-Z_]*"' "$W/scan.json" | head -1 | cut -d'"' -f4)"
 printf 'info  status before apply: %s\n' "$STATUS0"
@@ -108,10 +120,13 @@ if [ -s "$RUN_P/packages.before" ]; then
     check_eq "binary on disk is PATCHED" PATCHED "$(fpm_field "$W/patch.json" installed)"
     check_eq "running master uses the replaced binary (running=stale)" stale "$(fpm_field "$W/patch.json" running)"
     check_eq "status is RESTART_REQUIRED, not PATCHED" RESTART_REQUIRED "$(fpm_field "$W/patch.json" status)"
+    check_eq "second master is RESTART_REQUIRED too" RESTART_REQUIRED "$(conf_field "$W/patch.json" "$CUSTOM2/php-fpm.conf" status)"
     fpm_restart
     bash "$S" scan "${COMMON[@]}" --json "$W/scan2.json" >/dev/null 2>&1
-    check_eq "after the restart: status PATCHED" PATCHED "$(fpm_field "$W/scan2.json" status)"
-    check_eq "after the restart: running=yes" yes "$(fpm_field "$W/scan2.json" running)"
+    check_eq "after the restart: status PATCHED" PATCHED "$(conf_field "$W/scan2.json" "$CUSTOM/php-fpm.conf" status)"
+    check_eq "after the restart: running=yes" yes "$(conf_field "$W/scan2.json" "$CUSTOM/php-fpm.conf" running)"
+    check_eq "the master that was not restarted stays RESTART_REQUIRED" RESTART_REQUIRED "$(conf_field "$W/scan2.json" "$CUSTOM2/php-fpm.conf" status)"
+    fpm2_restart
   fi
 else
   skip "no newer package in the repositories (already patched, or vendor fix not published yet)"
@@ -130,10 +145,18 @@ check_eq "CLI sees session.upload_progress.enabled = Off" "Off" "$(upload_progre
 if [ -n "$FPM" ]; then
   check "php-fpm config test passes for the running configuration" "$FPM" -t -y "$CUSTOM/php-fpm.conf"
   check "the pool of the running master carries the admin-locked block" grep -q 'php_admin_value\[session.upload_progress.enabled\] = 0' "$POOL_DIR/custom.conf"
-  check_eq "running master started before the change: mitigation=pending_restart" pending_restart "$(fpm_field "$W/mit.json" mitigation)"
-  fpm_restart
+  check "the pool of the second master carries the block too" grep -q 'php_admin_value\[session.upload_progress.enabled\] = 0' "$CUSTOM2/pool.d/second.conf"
+  check_eq "running master started before the change: mitigation=pending_restart" pending_restart "$(conf_field "$W/mit.json" "$CUSTOM/php-fpm.conf" mitigation)"
+  fpm_restart; fpm2_restart
   bash "$S" scan "${COMMON[@]}" --json "$W/scan3.json" >/dev/null 2>&1
-  check_eq "after the restart: mitigation=effective" effective "$(fpm_field "$W/scan3.json" mitigation)"
+  check_eq "after the restart: mitigation=effective" effective "$(conf_field "$W/scan3.json" "$CUSTOM/php-fpm.conf" mitigation)"
+  check_eq "second master: mitigation=effective" effective "$(conf_field "$W/scan3.json" "$CUSTOM2/php-fpm.conf" mitigation)"
+  # A later pool line that sets the value back must not count as mitigated.
+  cp "$CUSTOM2/pool.d/second.conf" "$W/second.orig"
+  printf 'php_admin_flag[session.upload_progress.enabled] = on\n' >>"$CUSTOM2/pool.d/second.conf"
+  bash "$S" scan "${COMMON[@]}" --json "$W/scan4.json" >/dev/null 2>&1
+  check_eq "a pool that sets the value back: mitigation=not_effective" not_effective "$(conf_field "$W/scan4.json" "$CUSTOM2/php-fpm.conf" mitigation)"
+  cp "$W/second.orig" "$CUSTOM2/pool.d/second.conf"
 fi
 if [ "$HAS_MOD_PHP" -eq 1 ]; then
   check "Apache mitigation config exists" test -f "$APACHE_CONF"
@@ -155,7 +178,7 @@ for d in "${INI_DIRS[@]}"; do
   [ -d "$d" ] || continue
   check "mitigation ini removed from $d" test ! -f "$d/99-php-safepatch-php2shell.ini"
 done
-[ -n "$FPM" ] && check "FPM pool blocks removed" bash -c "! grep -q 'php-safepatch PHP2Shell' $POOL_DIR/*.conf"
+[ -n "$FPM" ] && check "FPM pool blocks removed (both masters)" bash -c "! grep -q 'php-safepatch PHP2Shell' $POOL_DIR/*.conf $CUSTOM2/pool.d/*.conf"
 check_eq "CLI value back to On" "On" "$(upload_progress)"
 if [ "$HAS_MOD_PHP" -eq 1 ]; then
   check "Apache mitigation config removed" test ! -e "$APACHE_CONF"
@@ -171,7 +194,7 @@ if [ -s "$RUN_P/packages.before" ]; then
   else
     fail "package rollback restores PHP $VER0 (rc=$rc, now $(php -r 'echo PHP_VERSION;'))"
   fi
-  [ -n "$FPM" ] && fpm_restart
+  [ -n "$FPM" ] && { fpm_restart; fpm2_restart; }
 else
   skip "package rollback (no packages were upgraded)"
 fi
@@ -192,7 +215,7 @@ if [ -n "$FPM" ]; then
     check "no ini written to $d" test ! -f "$d/99-php-safepatch-php2shell.ini"
   done
   cp "$W/pool.orig" "$POOL"
-  fpm_stop
+  fpm_stop; fpm2_stop
 else
   skip "no PHP-FPM in this image"
 fi
